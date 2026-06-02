@@ -14,3 +14,5 @@ obj/
 # OS
 .DS_Store
 Thumbs.db
+
+azd-ai-agents-*.log
