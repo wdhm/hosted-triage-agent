@@ -58,6 +58,24 @@ public sealed class DynamicAuthHandler(
         {
             logger.LogWarning("No GitHub token available for outbound MCP request to {Url}", request.RequestUri);
         }
-        return await base.SendAsync(request, cancellationToken);
+        var response = await base.SendAsync(request, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            string body = "";
+            try
+            {
+                body = await response.Content.ReadAsStringAsync(cancellationToken);
+                if (body.Length > 800) body = body[..800] + "...[truncated]";
+            }
+            catch { /* best-effort */ }
+            var tokenKind = string.IsNullOrEmpty(token)
+                ? "none"
+                : token.StartsWith("ghs_", StringComparison.Ordinal) ? "app-installation(ghs_)"
+                : token.StartsWith("ghp_", StringComparison.Ordinal) ? "pat(ghp_)"
+                : token.StartsWith("github_pat_", StringComparison.Ordinal) ? "fine-grained-pat"
+                : "unknown-prefix";
+            Console.WriteLine($"[MCP-ERR] {(int)response.StatusCode} {response.ReasonPhrase} {request.Method} {request.RequestUri} tokenKind={tokenKind} body={body}");
+        }
+        return response;
     }
 }
