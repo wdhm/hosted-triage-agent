@@ -90,11 +90,16 @@ jobs:
           # MCP itself. The reply is a one-line status string starting with "OK:"
           # or "FAILED:". The handler returns 502 on FAILED, so curl -f exits
           # non-zero and the workflow turns red automatically.
-          HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}?agent_session_id=${SESSION_ID}" \
+          # IMPORTANT: INVOCATIONS_URL already contains '?api-version=v1', so we
+          # MUST append session id with '&' (not '?'). Two '?' chars cause Foundry
+          # to reject with HTTP 400 "API version not supported" because the parser
+          # reads api-version's value as "v1?agent_session_id=...".
+          HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -H "Foundry-Features: HostedAgents=V1Preview" \
             --data-binary @/tmp/payload.json \
+            --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 \
             -o /tmp/reply.txt \
             -w '%{http_code}')
           echo "HTTP: $HTTP_CODE"
