@@ -89,6 +89,7 @@ public sealed class TriageInvocationHandler(
 
            ---
            <sub>You can follow up by commenting `@triage-agent <your question>` on this issue.</sub>
+           <!-- triage-agent-reply -->
 
            Severity emoji: 🔴 critical, 🟠 high, 🟡 medium, 🟢 low.
         9. Reply to this turn (your final assistant message) with EXACTLY one
@@ -128,6 +129,11 @@ public sealed class TriageInvocationHandler(
            Your reply MUST start with the literal prefix:
              🤖 **triage-agent (follow-up)**
            …so humans can tell it apart from your original triage comment.
+
+           Also end your reply with this hidden HTML comment on a new line:
+             <!-- triage-agent-reply -->
+           This marker prevents the workflow from echoing your own comments
+           back to you as a follow-up event (loop prevention).
         5. Reply to this turn (your final assistant message) with EXACTLY one
            line of the form:
              OK: replied to @<comment_author> on #<issue_number>
@@ -238,7 +244,28 @@ public sealed class TriageInvocationHandler(
             payload.CommentAuthor ?? "-");
 
         // ── Load/create session + invoke agent ─────────────────────────────
-        var (session, isNew) = await sessionStore.GetOrCreateAsync(sessionId, cancellationToken);
+        AgentSession session;
+        bool isNew;
+        try
+        {
+            (session, isNew) = await sessionStore.GetOrCreateAsync(sessionId, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            // Foundry may reject CreateSessionAsync during cold-start (model not
+            // warm, thread quota, transient backend). Don't let this leak as a
+            // raw ASP.NET 500 — surface it explicitly so the workflow retry can
+            // make a sensible decision and we see the cause in container logs.
+            Console.Error.WriteLine($"[handler] sessionStore.GetOrCreateAsync FAILED for {sessionId}: {ex.GetType().FullName}: {ex.Message}");
+            Console.Error.WriteLine(ex.ToString());
+            logger.LogError(ex, "Session create/restore failed for {SessionId}.", sessionId);
+            response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            response.ContentType = "text/plain; charset=utf-8";
+            await response.WriteAsync(
+                $"FAILED: session unavailable ({ex.GetType().Name}: {ex.Message}). Retry recommended.",
+                cancellationToken);
+            return;
+        }
         logger.LogInformation("Session: id={SessionId} isNew={IsNew}", sessionId, isNew);
 
         var userMessage = JsonSerializer.Serialize(payload);
@@ -250,7 +277,28 @@ public sealed class TriageInvocationHandler(
         }
         catch (Exception ex)
         {
+            Console.Error.WriteLine($"[handler] agent.RunAsync FAILED for {eventType} on #{payload.IssueNumber}: {ex.GetType().FullName}: {ex.Message}");
+            Console.Error.WriteLine(ex.ToString());
             logger.LogError(ex, "Agent run failed for {Event} on #{Issue}.", eventType, payload.IssueNumber);
+
+            // If we have a stored session and the run failed, the stored session
+            // pointer may be stale (e.g. Foundry thread expired or was created
+            // by a previous deployment of the agent). On next request we'd hit
+            // the same failure. Quarantine the bad session file so the next
+            // attempt starts fresh — accepting memory loss over permanent break.
+            if (!isNew)
+            {
+                try
+                {
+                    sessionStore.Quarantine(sessionId);
+                    Console.Error.WriteLine($"[handler] Quarantined stale session {sessionId}; next call will start fresh.");
+                }
+                catch (Exception qex)
+                {
+                    Console.Error.WriteLine($"[handler] Failed to quarantine {sessionId}: {qex.Message}");
+                }
+            }
+
             response.StatusCode = StatusCodes.Status502BadGateway;
             response.ContentType = "text/plain; charset=utf-8";
             await response.WriteAsync($"FAILED: agent run threw {ex.GetType().Name}: {ex.Message}", cancellationToken);
