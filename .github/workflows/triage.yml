@@ -92,6 +92,13 @@ jobs:
           # Build the JSON payload safely (jq handles all the quoting / escaping).
           # We always send title+body (current state, in case the issue was edited
           # since opening). comment_* fields are only populated for comment events.
+          # NOTE: We embed the GitHub App installation token in the JSON body
+          # (not a custom header) because Foundry's hosted-agent invocation
+          # gateway strips all non-allowlisted request headers before the
+          # handler sees them — including X-GitHub-Token. The token lives in
+          # the body field `github_token` and is consumed by the handler then
+          # immediately pushed onto an AsyncLocal for the per-request MCP
+          # auth handler. It is never logged or echoed back.
           jq -n \
             --arg event   "$EVENT" \
             --arg owner   "$REPO_OWNER" \
@@ -101,11 +108,17 @@ jobs:
             --arg body    "${ISSUE_BODY:-}" \
             --arg author  "${COMMENT_AUTHOR:-}" \
             --arg comment "${COMMENT_BODY:-}" \
-            '{event:$event, owner:$owner, repo:$repo, issue_number:$num, title:$title, body:$body, comment_author:$author, comment_body:$comment}' \
+            --arg ghtoken "${GITHUB_APP_TOKEN:-}" \
+            '{event:$event, owner:$owner, repo:$repo, issue_number:$num, title:$title, body:$body, comment_author:$author, comment_body:$comment, github_token:$ghtoken}' \
             > /tmp/payload.json
 
-          # Log shape only — never the body/comment, which are untrusted user content.
-          echo "Payload: event=$EVENT session=$SESSION_ID owner=$REPO_OWNER repo=$REPO_NAME issue=$ISSUE_NUMBER titleLen=${#ISSUE_TITLE} bodyLen=${#ISSUE_BODY} commentLen=${#COMMENT_BODY} author=${COMMENT_AUTHOR:-none}"
+          # Log shape only — never the body/comment/token, which are untrusted or secret.
+          echo "Payload: event=$EVENT session=$SESSION_ID owner=$REPO_OWNER repo=$REPO_NAME issue=$ISSUE_NUMBER titleLen=${#ISSUE_TITLE} bodyLen=${#ISSUE_BODY} commentLen=${#COMMENT_BODY} author=${COMMENT_AUTHOR:-none} ghTokenLen=${#GITHUB_APP_TOKEN}"
+          if [ -n "${GITHUB_APP_TOKEN:-}" ]; then
+            echo "GitHub App token present — agent will post as <app>[bot]."
+          else
+            echo "No GitHub App token — agent will use PAT fallback."
+          fi
 
           # The agent posts the comment (and labels, for issue.opened) via GitHub
           # MCP itself. The reply is a one-line status string starting with "OK:"
@@ -115,22 +128,10 @@ jobs:
           # MUST append session id with '&' (not '?'). Two '?' chars cause Foundry
           # to reject with HTTP 400 "API version not supported" because the parser
           # reads api-version's value as "v1?agent_session_id=...".
-          # Build a header arg conditionally — only send X-GitHub-Token when
-          # the GitHub App minted one this run. The agent treats its absence as
-          # "use the static PAT fallback from the Foundry connection".
-          GH_HEADER_ARGS=()
-          if [ -n "${GITHUB_APP_TOKEN:-}" ]; then
-            GH_HEADER_ARGS=(-H "X-GitHub-Token: ${GITHUB_APP_TOKEN}")
-            echo "GitHub App token present — agent will post as <app>[bot]."
-          else
-            echo "No GitHub App token — agent will use PAT fallback."
-          fi
-
           HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -H "Foundry-Features: HostedAgents=V1Preview" \
-            "${GH_HEADER_ARGS[@]}" \
             --data-binary @/tmp/payload.json \
             --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 \
             -o /tmp/reply.txt \
