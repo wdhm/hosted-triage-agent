@@ -37,6 +37,22 @@ jobs:
        contains(github.event.comment.body, '@triage-agent'))
     runs-on: ubuntu-latest
     steps:
+      - name: Mint GitHub App installation token
+        id: app-token
+        # When the GitHub App secrets are configured, mint a per-run installation
+        # token (valid 1h) so the agent posts comments/labels with its own bot
+        # identity (e.g. `triage-agent[bot]`) instead of the PAT owner. If the
+        # secrets are missing (e.g. forks, early dev), this step is skipped and
+        # the agent falls back to the PAT stored in the Foundry connection.
+        if: ${{ secrets.TRIAGE_AGENT_APP_ID != '' && secrets.TRIAGE_AGENT_APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.TRIAGE_AGENT_APP_ID }}
+          private-key: ${{ secrets.TRIAGE_AGENT_APP_PRIVATE_KEY }}
+          # Only mint a token scoped to this repo, not the whole installation.
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -55,6 +71,7 @@ jobs:
           ISSUE_BODY: ${{ github.event.issue.body }}
           COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          GITHUB_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
@@ -97,10 +114,22 @@ jobs:
           # MUST append session id with '&' (not '?'). Two '?' chars cause Foundry
           # to reject with HTTP 400 "API version not supported" because the parser
           # reads api-version's value as "v1?agent_session_id=...".
+          # Build a header arg conditionally — only send X-GitHub-Token when
+          # the GitHub App minted one this run. The agent treats its absence as
+          # "use the static PAT fallback from the Foundry connection".
+          GH_HEADER_ARGS=()
+          if [ -n "${GITHUB_APP_TOKEN:-}" ]; then
+            GH_HEADER_ARGS=(-H "X-GitHub-Token: ${GITHUB_APP_TOKEN}")
+            echo "GitHub App token present — agent will post as <app>[bot]."
+          else
+            echo "No GitHub App token — agent will use PAT fallback."
+          fi
+
           HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -H "Foundry-Features: HostedAgents=V1Preview" \
+            "${GH_HEADER_ARGS[@]}" \
             --data-binary @/tmp/payload.json \
             --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 \
             -o /tmp/reply.txt \

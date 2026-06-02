@@ -76,21 +76,45 @@ try
         throw new InvalidOperationException(
             $"Connection '{mcpConnectionName}' does not contain an 'Authorization' key. Keys present: [{string.Join(", ", customCreds.Keys.Keys)}].");
     }
-    Console.WriteLine($"[startup] PAT loaded from Foundry connection ({authHeader.Length} chars).");
+    // Strip optional "Bearer " prefix — the DynamicAuthHandler re-adds it.
+    var fallbackToken = authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+        ? authHeader["Bearer ".Length..].Trim()
+        : authHeader.Trim();
+    Console.WriteLine($"[startup] Fallback PAT loaded from Foundry connection ({fallbackToken.Length} chars).");
+
+    // GitHub identity strategy:
+    //   - Preferred path (production): workflow mints a GitHub App installation
+    //     token per run and sends it as `X-GitHub-Token` on the invocation POST.
+    //     TriageInvocationHandler pushes it onto GitHubTokenProvider's AsyncLocal,
+    //     DynamicAuthHandler stamps it on every outbound MCP HTTP call. The
+    //     agent then posts/labels as `<app>[bot]` with its own identity.
+    //   - Fallback path (CLI / local testing): the PAT from the Foundry
+    //     connection above is used. Lets us invoke without a workflow.
+    var tokenProvider = new GitHubTokenProvider(fallbackToken);
 
     // Connect to the GitHub remote MCP server (Streamable HTTP transport). The
-    // PAT travels only via the Authorization header on outbound HTTP calls.
+    // DynamicAuthHandler injects the per-request token (or fallback PAT) onto
+    // every outbound HTTP call — both the initial handshake (uses fallback) and
+    // per-tool-invocation calls (use AsyncLocal token from the request).
     Console.WriteLine("[startup] Connecting to GitHub MCP server...");
-    var transport = new HttpClientTransport(new HttpClientTransportOptions
+    var dynamicHandler = new DynamicAuthHandler(
+        tokenProvider,
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<DynamicAuthHandler>.Instance)
     {
-        Endpoint = new Uri("https://api.githubcopilot.com/mcp/"),
-        Name = "github-mcp",
-        TransportMode = HttpTransportMode.StreamableHttp,
-        AdditionalHeaders = new Dictionary<string, string>
+        InnerHandler = new HttpClientHandler(),
+    };
+    var mcpHttpClient = new HttpClient(dynamicHandler);
+    var transport = new HttpClientTransport(
+        new HttpClientTransportOptions
         {
-            ["Authorization"] = authHeader,
+            Endpoint = new Uri("https://api.githubcopilot.com/mcp/"),
+            Name = "github-mcp",
+            TransportMode = HttpTransportMode.StreamableHttp,
+            // No AdditionalHeaders["Authorization"] — DynamicAuthHandler owns it.
         },
-    });
+        httpClient: mcpHttpClient,
+        loggerFactory: null,
+        ownsHttpClient: true);
 
     var mcpClient = McpClient.CreateAsync(transport).GetAwaiter().GetResult();
     Console.WriteLine("[startup] MCP client connected.");
@@ -156,6 +180,7 @@ try
 
     Console.WriteLine("[startup] Both agents constructed.");
 
+    builder.Services.AddSingleton(tokenProvider);
     builder.Services.AddSingleton(mcpClient);
     builder.Services.AddSingleton(new AgentBundle(triageAgent, followupAgent));
     builder.Services.AddSingleton<FoundrySessionStore>(sp =>
