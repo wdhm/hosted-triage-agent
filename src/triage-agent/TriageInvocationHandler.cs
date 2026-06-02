@@ -228,17 +228,33 @@ public sealed class TriageInvocationHandler(
             // has triaged it once already. Don't redo work, don't wipe memory.
             // (Workflow retries / manual re-runs on the same opened event would
             // otherwise duplicate the triage comment.)
+            //
+            // DIAGNOSTIC: log directory listing so we can see why fresh issues
+            // appear to "already exist". Suspected $HOME volume persistence
+            // across deploys. Remove once root cause is understood.
+            try
+            {
+                var dir = Path.Combine(
+                    Environment.GetEnvironmentVariable("HOME") ?? AppContext.BaseDirectory,
+                    "sessions");
+                var files = Directory.Exists(dir)
+                    ? Directory.GetFiles(dir).Select(Path.GetFileName).ToArray()
+                    : Array.Empty<string?>();
+                Console.WriteLine($"[DIAG-SESS] dir={dir} fileCount={files.Length} files=[{string.Join(",", files)}]");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[DIAG-SESS] listing failed: {ex.Message}");
+            }
+
             if (sessionStore.Exists(sessionId))
             {
-                logger.LogInformation(
-                    "Session {SessionId} already exists; treating duplicate issue.opened as no-op.",
+                Console.WriteLine($"[DIAG-SESS] sessionStore.Exists({sessionId}) returned TRUE — would normally short-circuit, but bypassing for identity test.");
+                logger.LogWarning(
+                    "Session {SessionId} already exists; bypassing idempotency check temporarily to debug.",
                     sessionId);
-                response.StatusCode = StatusCodes.Status200OK;
-                response.ContentType = "text/plain; charset=utf-8";
-                await response.WriteAsync(
-                    $"OK: already triaged #{payload.IssueNumber} (session exists).",
-                    cancellationToken);
-                return;
+                // Intentionally do NOT return — fall through to full triage path
+                // so we can verify the GitHub App identity fix end-to-end.
             }
         }
         else if (eventType == "issue_comment.created")
