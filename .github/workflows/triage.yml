@@ -29,32 +29,78 @@ jobs:
         run: |
           set -euo pipefail
           TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
-          INPUT=$(printf 'Title: %s\n\nBody:\n%s\n' "$ISSUE_TITLE" "$ISSUE_BODY")
-          printf '%s' "$INPUT" > /tmp/payload.txt
+          printf 'Title: %s\n\nBody:\n%s\n' "$ISSUE_TITLE" "$ISSUE_BODY" > /tmp/payload.txt
           curl -fsS -X POST "$INVOCATIONS_URL" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: text/plain" \
             -H "Foundry-Features: HostedAgents=V1Preview" \
             --data-binary @/tmp/payload.txt \
-            -o /tmp/reply.txt
+            -o /tmp/reply.json
           echo "Agent reply:"
-          cat /tmp/reply.txt
+          cat /tmp/reply.json
+          echo
 
-      - name: Post reply as issue comment
+      - name: Format reply and post comment + labels
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
+
+          SEVERITY=$(jq -r '.severity // "unknown"'  /tmp/reply.json)
+          CATEGORY=$(jq -r '.category // "unknown"'  /tmp/reply.json)
+          SUMMARY=$(jq -r  '.summary // ""'          /tmp/reply.json)
+          ROOT_CAUSE=$(jq -r '.root_cause // ""'     /tmp/reply.json)
+          LABELS_CSV=$(jq -r '(.suggested_labels // []) | join(",")' /tmp/reply.json)
+          NEXT_ACTIONS=$(jq -r '(.next_actions // []) | map("- " + .) | join("\n")' /tmp/reply.json)
+
+          # Severity emoji
+          case "$SEVERITY" in
+            critical) BADGE="🔴 **CRITICAL**" ;;
+            high)     BADGE="🟠 **HIGH**" ;;
+            medium)   BADGE="🟡 **MEDIUM**" ;;
+            low)      BADGE="🟢 **LOW**" ;;
+            *)        BADGE="⚪ **${SEVERITY}**" ;;
+          esac
+
           {
-            echo "🤖 **triage-agent** (M1 echo)"
+            echo "🤖 **triage-agent**"
             echo
-            echo '```'
-            cat /tmp/reply.txt
+            echo "| Severity | Category |"
+            echo "|---|---|"
+            echo "| ${BADGE} | \`${CATEGORY}\` |"
             echo
-            echo '```'
+            echo "**Summary**"
+            echo
+            echo "> ${SUMMARY}"
+            echo
+            echo "**Likely root cause**"
+            echo
+            echo "${ROOT_CAUSE}"
+            if [ -n "${NEXT_ACTIONS}" ]; then
+              echo
+              echo "**Suggested next actions**"
+              echo
+              echo "${NEXT_ACTIONS}"
+            fi
+            if [ -n "${LABELS_CSV}" ]; then
+              echo
+              echo "**Suggested labels:** \`${LABELS_CSV//,/\`, \`}\`"
+            fi
+            echo
+            echo "<sub><em>Hosted in Microsoft Foundry · model \`gpt-5-mini\` · structured JSON output</em></sub>"
             echo
             echo "<!-- triage-agent-signature -->"
           } > /tmp/comment.md
+
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
+
+          # Best-effort apply labels — create missing labels on the fly with a neutral color.
+          if [ -n "${LABELS_CSV}" ]; then
+            IFS=',' read -ra LABELS <<< "$LABELS_CSV"
+            for L in "${LABELS[@]}"; do
+              gh label create "$L" --color BFD4F2 --repo "$REPO" 2>/dev/null || true
+              gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "$L" || true
+            done
+          fi

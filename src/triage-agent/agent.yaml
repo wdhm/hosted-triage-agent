@@ -3,16 +3,17 @@
 kind: hosted
 name: triage-agent
 description: |
-    A minimal echo agent hosted as a Foundry Hosted Agent using the Invocations protocol and the Agent Framework. Reads the request body as plain text, echoes it back in the response. No LLM or Azure credentials are required.
+    GitHub issue triage agent. Reads an issue title + body (with optional logs / stack traces) and returns a structured triage assessment (severity, category, summary, root cause, suggested labels, next actions) as JSON. Uses gpt-5-mini via the Foundry project's Responses API with strict JSON-schema output.
 metadata:
     tags:
-        - AI Agent Hosting
-        - Azure AI AgentServer
+        - Triage
+        - GitHub Issues
         - Invocations Protocol
         - Agent Framework
+        - Structured Output
 protocols:
     - protocol: invocations
       version: 1.0.0
 resources:
-    cpu: "0.5"
-    memory: 1Gi
+    cpu: "1.0"
+    memory: 2Gi
