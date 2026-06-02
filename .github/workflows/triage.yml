@@ -39,12 +39,13 @@ jobs:
     steps:
       - name: Mint GitHub App installation token
         id: app-token
-        # When the GitHub App secrets are configured, mint a per-run installation
-        # token (valid 1h) so the agent posts comments/labels with its own bot
-        # identity (e.g. `triage-agent[bot]`) instead of the PAT owner. If the
-        # secrets are missing (e.g. forks, early dev), this step is skipped and
-        # the agent falls back to the PAT stored in the Foundry connection.
-        if: ${{ secrets.TRIAGE_AGENT_APP_ID != '' && secrets.TRIAGE_AGENT_APP_PRIVATE_KEY != '' }}
+        # Mint a per-run installation token (valid 1h) so the agent posts
+        # comments/labels with its own bot identity (`<app>[bot]`) instead of
+        # the PAT owner. Requires repo secrets TRIAGE_AGENT_APP_ID and
+        # TRIAGE_AGENT_APP_PRIVATE_KEY to be set; if they're missing this step
+        # fails and the workflow stops. (We can't gate on `secrets.X != ''` in
+        # an `if:` — GitHub rejects reading the secrets context in conditional
+        # expressions, which silently invalidates the whole workflow file.)
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.TRIAGE_AGENT_APP_ID }}
