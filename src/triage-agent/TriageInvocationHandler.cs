@@ -22,6 +22,7 @@ namespace TriageAgent;
 public sealed class TriageInvocationHandler(
     AgentBundle agents,
     FoundrySessionStore sessionStore,
+    GitHubTokenProvider tokenProvider,
     ILogger<TriageInvocationHandler> logger) : InvocationHandler
 {
     public const string TriageSystemInstruction = """
@@ -153,6 +154,29 @@ public sealed class TriageInvocationHandler(
         logger.LogInformation(
             "Invocation received: invocationId={InvocationId} sessionId={SessionId}",
             context.InvocationId, sessionId);
+
+        // Pull the per-request GitHub App installation token (minted by the
+        // workflow). If present, push onto AsyncLocal so DynamicAuthHandler
+        // stamps it on every outbound MCP call for this request. If absent
+        // (e.g. direct CLI invocation), the static PAT fallback is used.
+        // `using` ensures we pop the AsyncLocal at the end of this method,
+        // regardless of how we exit (return, throw, await).
+        string? perRequestToken = null;
+        if (request.Headers.TryGetValue("X-GitHub-Token", out var ghHeader))
+        {
+            perRequestToken = ghHeader.ToString();
+        }
+        using var _tokenScope = string.IsNullOrWhiteSpace(perRequestToken)
+            ? (IDisposable)new NoopDisposable()
+            : tokenProvider.PushToken(perRequestToken);
+        if (!string.IsNullOrWhiteSpace(perRequestToken))
+        {
+            logger.LogInformation("Using per-request GitHub App token ({Len} chars).", perRequestToken.Length);
+        }
+        else
+        {
+            logger.LogInformation("No X-GitHub-Token header; falling back to static PAT.");
+        }
 
         // ── Parse + validate payload ────────────────────────────────────────
         string rawBody;
@@ -340,4 +364,9 @@ public sealed class TriageInvocationHandler(
         [property: JsonPropertyName("body")] string? Body,
         [property: JsonPropertyName("comment_author")] string? CommentAuthor,
         [property: JsonPropertyName("comment_body")] string? CommentBody);
+
+    private sealed class NoopDisposable : IDisposable
+    {
+        public void Dispose() { }
+    }
 }
