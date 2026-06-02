@@ -24,13 +24,16 @@ jobs:
   triage:
     # Gate: only run on issues.opened, OR on issue_comment.created when:
     #   - it's an issue (not a PR comment)
-    #   - the commenter is NOT our triage-agent PAT identity (loop prevention)
+    #   - the comment is NOT our agent's own reply (identity-independent loop
+    #     prevention: agent always emits a hidden HTML marker in its replies)
+    #   - belt-and-suspenders: also reject by PAT identity, when configured
     #   - the comment body @-mentions the agent
     if: |
       github.event_name == 'issues' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request == null &&
-       github.event.comment.user.login != vars.TRIAGE_AGENT_LOGIN &&
+       !contains(github.event.comment.body, '<!-- triage-agent-reply -->') &&
+       (vars.TRIAGE_AGENT_LOGIN == '' || github.event.comment.user.login != vars.TRIAGE_AGENT_LOGIN) &&
        contains(github.event.comment.body, '@triage-agent'))
     runs-on: ubuntu-latest
     steps:

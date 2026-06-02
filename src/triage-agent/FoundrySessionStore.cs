@@ -86,6 +86,20 @@ public sealed class FoundrySessionStore(
     /// </summary>
     public bool Exists(string sessionId) => File.Exists(PathFor(sessionId));
 
+    /// <summary>
+    /// Renames a session file to <c>.quarantined-{timestamp}</c> so the next
+    /// request starts fresh. Used when a resumed session causes RunAsync to
+    /// fail (likely stale ConversationId after a redeploy or thread expiry).
+    /// We rename rather than delete so the bad file is still inspectable.
+    /// </summary>
+    public void Quarantine(string sessionId)
+    {
+        var path = PathFor(sessionId);
+        if (!File.Exists(path)) return;
+        var quarantinePath = path + $".quarantined-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}";
+        File.Move(path, quarantinePath, overwrite: true);
+    }
+
     private static string PathFor(string sessionId) =>
         Path.Combine(_dir, $"{SanitizeKey(sessionId)}.json");
 
