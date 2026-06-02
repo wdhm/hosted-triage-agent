@@ -3,6 +3,8 @@ name: Triage Agent
 on:
   issues:
     types: [opened]
+  issue_comment:
+    types: [created]
 
 permissions:
   # The agent posts the comment and labels itself via the GitHub MCP server,
@@ -11,8 +13,25 @@ permissions:
   id-token: write
   contents: read
 
+# Per-issue concurrency: prevents double-clicks, retries, and rapid follow-ups
+# from racing on the same Foundry session. We don't cancel in-progress runs —
+# that would leave the agent mid-tool-call. Just queue the next one.
+concurrency:
+  group: triage-${{ github.repository_id }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   triage:
+    # Gate: only run on issues.opened, OR on issue_comment.created when:
+    #   - it's an issue (not a PR comment)
+    #   - the commenter is NOT our triage-agent PAT identity (loop prevention)
+    #   - the comment body @-mentions the agent
+    if: |
+      github.event_name == 'issues' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request == null &&
+       github.event.comment.user.login != vars.TRIAGE_AGENT_LOGIN &&
+       contains(github.event.comment.body, '@triage-agent'))
     runs-on: ubuntu-latest
     steps:
       - name: Azure Login (OIDC)
@@ -25,33 +44,53 @@ jobs:
       - name: Invoke Foundry hosted triage agent
         env:
           INVOCATIONS_URL: ${{ vars.FOUNDRY_INVOCATIONS_URL }}
+          EVENT_NAME: ${{ github.event_name }}
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
           TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
 
+          # Stable per-issue session ID — all turns on the same issue use this
+          # so the agent has full conversation memory via Foundry's thread store.
+          # Lowercased to match the handler's path-sanitizing rules.
+          SESSION_ID=$(echo "gh-${REPO_OWNER}-${REPO_NAME}-${ISSUE_NUMBER}" | tr '[:upper:]' '[:lower:]')
+
+          # Map GitHub event_name -> our internal event field
+          if [ "$EVENT_NAME" = "issues" ]; then
+            EVENT="issue.opened"
+          else
+            EVENT="issue_comment.created"
+          fi
+
           # Build the JSON payload safely (jq handles all the quoting / escaping).
+          # We always send title+body (current state, in case the issue was edited
+          # since opening). comment_* fields are only populated for comment events.
           jq -n \
+            --arg event   "$EVENT" \
             --arg owner   "$REPO_OWNER" \
             --arg repo    "$REPO_NAME" \
             --argjson num  "$ISSUE_NUMBER" \
             --arg title   "$ISSUE_TITLE" \
             --arg body    "${ISSUE_BODY:-}" \
-            '{owner:$owner, repo:$repo, issue_number:$num, title:$title, body:$body}' \
+            --arg author  "${COMMENT_AUTHOR:-}" \
+            --arg comment "${COMMENT_BODY:-}" \
+            '{event:$event, owner:$owner, repo:$repo, issue_number:$num, title:$title, body:$body, comment_author:$author, comment_body:$comment}' \
             > /tmp/payload.json
 
-          # Log shape only — never the body, which is untrusted user content.
-          echo "Payload: owner=$REPO_OWNER repo=$REPO_NAME issue=$ISSUE_NUMBER titleLen=${#ISSUE_TITLE} bodyLen=${#ISSUE_BODY}"
+          # Log shape only — never the body/comment, which are untrusted user content.
+          echo "Payload: event=$EVENT session=$SESSION_ID owner=$REPO_OWNER repo=$REPO_NAME issue=$ISSUE_NUMBER titleLen=${#ISSUE_TITLE} bodyLen=${#ISSUE_BODY} commentLen=${#COMMENT_BODY} author=${COMMENT_AUTHOR:-none}"
 
-          # The agent posts the comment and labels via GitHub MCP. The reply is
-          # a one-line status string starting with "OK:" or "FAILED:". The
-          # handler returns 502 on FAILED, so curl -f will exit non-zero and the
-          # workflow turns red automatically.
-          curl -fsS -X POST "$INVOCATIONS_URL" \
+          # The agent posts the comment (and labels, for issue.opened) via GitHub
+          # MCP itself. The reply is a one-line status string starting with "OK:"
+          # or "FAILED:". The handler returns 502 on FAILED, so curl -f exits
+          # non-zero and the workflow turns red automatically.
+          curl -fsS -X POST "${INVOCATIONS_URL}?agent_session_id=${SESSION_ID}" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -H "Foundry-Features: HostedAgents=V1Preview" \
