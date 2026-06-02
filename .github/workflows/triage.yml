@@ -34,7 +34,7 @@ jobs:
        github.event.issue.pull_request == null &&
        !contains(github.event.comment.body, '<!-- triage-agent-reply -->') &&
        !endsWith(github.event.comment.user.login, '[bot]') &&
-       contains(github.event.comment.body, '@triage-agent'))
+       contains(github.event.comment.body, '@wdhm-triage-agent'))
     runs-on: ubuntu-latest
     steps:
       - name: Mint GitHub App installation token
