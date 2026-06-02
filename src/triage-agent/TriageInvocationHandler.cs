@@ -152,31 +152,8 @@ public sealed class TriageInvocationHandler(
         var sessionId = context.SessionId;
 
         logger.LogInformation(
-            "Invocation received: invocationId={InvocationId} sessionId={SessionId}",
-            context.InvocationId, sessionId);
-
-        // Pull the per-request GitHub App installation token (minted by the
-        // workflow). If present, push onto AsyncLocal so DynamicAuthHandler
-        // stamps it on every outbound MCP call for this request. If absent
-        // (e.g. direct CLI invocation), the static PAT fallback is used.
-        // `using` ensures we pop the AsyncLocal at the end of this method,
-        // regardless of how we exit (return, throw, await).
-        string? perRequestToken = null;
-        if (request.Headers.TryGetValue("X-GitHub-Token", out var ghHeader))
-        {
-            perRequestToken = ghHeader.ToString();
-        }
-        using var _tokenScope = string.IsNullOrWhiteSpace(perRequestToken)
-            ? (IDisposable)new NoopDisposable()
-            : tokenProvider.PushToken(perRequestToken);
-        if (!string.IsNullOrWhiteSpace(perRequestToken))
-        {
-            logger.LogInformation("Using per-request GitHub App token ({Len} chars).", perRequestToken.Length);
-        }
-        else
-        {
-            logger.LogInformation("No X-GitHub-Token header; falling back to static PAT.");
-        }
+            "Invocation received: invocationId={InvocationId} sessionId={SessionId} headerCount={HeaderCount}",
+            context.InvocationId, sessionId, request.Headers.Count);
 
         // ── Parse + validate payload ────────────────────────────────────────
         string rawBody;
@@ -213,6 +190,23 @@ public sealed class TriageInvocationHandler(
         }
 
         var eventType = payload.Event ?? "issue.opened"; // default for backward compat with direct invocation
+
+        // Pull the per-request GitHub App installation token (minted by the
+        // workflow) from the JSON body. We deliberately do NOT use a custom
+        // request header here because Foundry's hosted-agent invocation
+        // gateway strips all non-allowlisted request headers before the
+        // handler sees them. If present, push onto AsyncLocal so the
+        // DynamicAuthHandler stamps it on every outbound MCP call for this
+        // request. If absent (e.g. direct CLI invocation), the static PAT
+        // fallback configured in Program.cs is used. `using` ensures we pop
+        // the AsyncLocal at the end of this method, regardless of how we
+        // exit (return, throw, await).
+        using var _tokenScope = string.IsNullOrWhiteSpace(payload.GithubToken)
+            ? (IDisposable)new NoopDisposable()
+            : tokenProvider.PushToken(payload.GithubToken);
+        logger.LogInformation(
+            "Per-request GitHub token: source={Source}",
+            string.IsNullOrWhiteSpace(payload.GithubToken) ? "static-PAT-fallback" : "github-app-installation");
 
         // ── Event-specific validation ──────────────────────────────────────
         if (eventType == "issue_comment.created"
@@ -363,7 +357,8 @@ public sealed class TriageInvocationHandler(
         [property: JsonPropertyName("title")] string? Title,
         [property: JsonPropertyName("body")] string? Body,
         [property: JsonPropertyName("comment_author")] string? CommentAuthor,
-        [property: JsonPropertyName("comment_body")] string? CommentBody);
+        [property: JsonPropertyName("comment_body")] string? CommentBody,
+        [property: JsonPropertyName("github_token")] string? GithubToken);
 
     private sealed class NoopDisposable : IDisposable
     {
