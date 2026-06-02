@@ -17,6 +17,7 @@ foreach (var name in new[]
     "TRIAGE_MODEL_DEPLOYMENT",
     "GITHUB_MCP_CONNECTION_NAME",
     "APPLICATIONINSIGHTS_CONNECTION_STRING",
+    "HOME",
 })
 {
     var v = Environment.GetEnvironmentVariable(name);
@@ -94,47 +95,77 @@ try
     var mcpClient = McpClient.CreateAsync(transport).GetAwaiter().GetResult();
     Console.WriteLine("[startup] MCP client connected.");
 
-    // List tools the server advertises and filter to just the ones we need.
-    // The model's allowlist matches what's referenced in the system prompt.
     var allTools = mcpClient.ListToolsAsync().GetAwaiter().GetResult();
     Console.WriteLine($"[startup] Server advertises {allTools.Count} tools.");
 
-    var allowedToolNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    // ── Two agents, two tool allowlists ──────────────────────────────────────
+    // triageAgent  : posts comment + applies labels (issue.opened path)
+    // followupAgent: posts comment only (issue_comment.created path) — narrower
+    //                blast radius so a follow-up can't accidentally re-label.
+
+    var triageToolNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "add_issue_comment",
-        "create_issue_comment",   // alternative name on some server versions
+        "create_issue_comment",
         "issue_write",
-        "update_issue",            // alternative name on some server versions
+        "update_issue",
         "label_write",
-        "create_label",            // alternative name on some server versions
+        "create_label",
         "get_label",
     };
 
-    var filteredTools = allTools
-        .Where(t => allowedToolNames.Contains(t.Name))
-        .Cast<AITool>()
-        .ToList();
-
-    Console.WriteLine($"[startup] Using {filteredTools.Count} filtered tools: {string.Join(", ", filteredTools.Select(t => t.Name))}");
-
-    if (filteredTools.Count == 0)
+    var followupToolNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        var sample = string.Join(", ", allTools.Take(15).Select(t => t.Name));
-        Console.WriteLine($"[startup] WARNING: zero tools matched the allowlist. First advertised tools: {sample}");
-    }
+        "add_issue_comment",
+        "create_issue_comment",
+    };
 
-    // ChatClientAgent wraps its IChatClient with FunctionInvokingChatClient
-    // automatically (UseProvidedChatClientAsIs defaults to false), so tool
-    // calls execute through the MCP client without any extra middleware.
+    var triageTools = allTools.Where(t => triageToolNames.Contains(t.Name))
+        .Cast<AITool>().ToList();
+    var followupTools = allTools.Where(t => followupToolNames.Contains(t.Name))
+        .Cast<AITool>().ToList();
+
+    Console.WriteLine($"[startup] Triage tools ({triageTools.Count}): {string.Join(", ", triageTools.Select(t => t.Name))}");
+    Console.WriteLine($"[startup] Follow-up tools ({followupTools.Count}): {string.Join(", ", followupTools.Select(t => t.Name))}");
+
+    // Fail-fast guards — startup should not succeed if the server's tool surface
+    // has drifted away from what our prompts assume.
+    bool HasAny(IEnumerable<AITool> tools, params string[] names) =>
+        tools.Any(t => names.Contains(t.Name, StringComparer.OrdinalIgnoreCase));
+
+    if (!HasAny(triageTools, "add_issue_comment", "create_issue_comment"))
+        throw new InvalidOperationException("GitHub MCP server is missing a comment-post tool (add_issue_comment / create_issue_comment).");
+    if (!HasAny(triageTools, "issue_write", "update_issue"))
+        throw new InvalidOperationException("GitHub MCP server is missing an issue-update tool (issue_write / update_issue).");
+    if (!HasAny(triageTools, "get_label"))
+        throw new InvalidOperationException("GitHub MCP server is missing the get_label tool.");
+    if (!HasAny(followupTools, "add_issue_comment", "create_issue_comment"))
+        throw new InvalidOperationException("Follow-up agent has no comment-post tool wired.");
+
     ChatClientAgent triageAgent = projectClient.AsAIAgent(
         model: modelDeployment,
-        instructions: TriageInvocationHandler.SystemInstruction,
+        instructions: TriageInvocationHandler.TriageSystemInstruction,
         name: "triage-agent",
-        tools: filteredTools);
-    Console.WriteLine("[startup] AIAgent constructed with MCP tools.");
+        tools: triageTools);
 
-    builder.Services.AddSingleton<AIAgent>(triageAgent);
+    ChatClientAgent followupAgent = projectClient.AsAIAgent(
+        model: modelDeployment,
+        instructions: TriageInvocationHandler.FollowupSystemInstruction,
+        name: "triage-agent-followup",
+        tools: followupTools);
+
+    Console.WriteLine("[startup] Both agents constructed.");
+
     builder.Services.AddSingleton(mcpClient);
+    builder.Services.AddSingleton(new AgentBundle(triageAgent, followupAgent));
+    builder.Services.AddSingleton<FoundrySessionStore>(sp =>
+        new FoundrySessionStore(
+            // session store binds to followupAgent because both agents share the
+            // same underlying Foundry thread model — serialize/deserialize works
+            // identically on either, but we pick the narrower agent to make it
+            // obvious that the store isn't tool-aware.
+            sp.GetRequiredService<AgentBundle>().Followup,
+            sp.GetRequiredService<ILogger<FoundrySessionStore>>()));
     builder.Services.AddInvocationsServer();
     builder.Services.AddScoped<InvocationHandler, TriageInvocationHandler>();
 
@@ -153,3 +184,9 @@ catch (Exception ex)
 }
 
 #pragma warning restore MEAI001, OPENAI001
+
+namespace TriageAgent
+{
+    /// <summary>Holds both agent instances so the handler can pick one per event.</summary>
+    public sealed record AgentBundle(AIAgent Triage, AIAgent Followup);
+}
