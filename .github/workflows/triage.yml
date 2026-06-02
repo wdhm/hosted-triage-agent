@@ -1,0 +1,60 @@
+name: Triage Agent
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  id-token: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Invoke Foundry hosted agent
+        id: invoke
+        env:
+          INVOCATIONS_URL: ${{ vars.FOUNDRY_INVOCATIONS_URL }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
+          INPUT=$(printf 'Title: %s\n\nBody:\n%s\n' "$ISSUE_TITLE" "$ISSUE_BODY")
+          printf '%s' "$INPUT" > /tmp/payload.txt
+          curl -fsS -X POST "$INVOCATIONS_URL" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: text/plain" \
+            -H "Foundry-Features: HostedAgents=V1Preview" \
+            --data-binary @/tmp/payload.txt \
+            -o /tmp/reply.txt
+          echo "Agent reply:"
+          cat /tmp/reply.txt
+
+      - name: Post reply as issue comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          {
+            echo "🤖 **triage-agent** (M1 echo)"
+            echo
+            echo '```'
+            cat /tmp/reply.txt
+            echo
+            echo '```'
+            echo
+            echo "<!-- triage-agent-signature -->"
+          } > /tmp/comment.md
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
