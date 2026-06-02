@@ -69,7 +69,7 @@ public sealed class TriageInvocationHandler(
         8. Call add_issue_comment {owner, repo, issue_number, body=<markdown>}
            with a comment of the form:
 
-           🤖 **triage-agent**
+           🤖 **wdhm-triage-agent**
 
            | Severity | Category |
            |---|---|
@@ -89,7 +89,7 @@ public sealed class TriageInvocationHandler(
            - <action 2>
 
            ---
-           <sub>You can follow up by commenting `@triage-agent <your question>` on this issue.</sub>
+           <sub>You can follow up by commenting `@wdhm-triage-agent <your question>` on this issue.</sub>
            <!-- triage-agent-reply -->
 
            Severity emoji: 🔴 critical, 🟠 high, 🟡 medium, 🟢 low.
@@ -120,7 +120,7 @@ public sealed class TriageInvocationHandler(
           come from the top-level JSON fields.
 
         Procedure:
-        1. Read `comment_body` — strip the leading `@triage-agent` mention.
+        1. Read `comment_body` — strip the leading `@wdhm-triage-agent` mention.
         2. Decide if the question is answerable from prior context + current
            issue state (provided in `title`/`body`, which may have been edited
            since you first triaged).
@@ -128,7 +128,7 @@ public sealed class TriageInvocationHandler(
            where useful). Address `@<comment_author>` at the start.
         4. Call add_issue_comment {owner, repo, issue_number, body=<your reply>}.
            Your reply MUST start with the literal prefix:
-             🤖 **triage-agent (follow-up)**
+             🤖 **wdhm-triage-agent (follow-up)**
            …so humans can tell it apart from your original triage comment.
 
            Also end your reply with this hidden HTML comment on a new line:
