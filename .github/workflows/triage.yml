@@ -90,12 +90,18 @@ jobs:
           # MCP itself. The reply is a one-line status string starting with "OK:"
           # or "FAILED:". The handler returns 502 on FAILED, so curl -f exits
           # non-zero and the workflow turns red automatically.
-          curl -fsS -X POST "${INVOCATIONS_URL}?agent_session_id=${SESSION_ID}" \
+          HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}?agent_session_id=${SESSION_ID}" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -H "Foundry-Features: HostedAgents=V1Preview" \
             --data-binary @/tmp/payload.json \
-            -o /tmp/reply.txt
-          echo "Agent status:"
+            -o /tmp/reply.txt \
+            -w '%{http_code}')
+          echo "HTTP: $HTTP_CODE"
+          echo "Agent response body:"
           cat /tmp/reply.txt
           echo
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Foundry returned HTTP $HTTP_CODE"
+            exit 1
+          fi
