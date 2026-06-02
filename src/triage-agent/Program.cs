@@ -1,16 +1,14 @@
 using Azure.AI.AgentServer.Invocations;
 using Azure.AI.Projects;
-using Azure.AI.Projects.Agents;
 using Microsoft.Agents.AI;
-using OpenAI.Responses;
+using Microsoft.Extensions.AI;
+using ModelContextProtocol.Client;
 using TriageAgent;
 
-// Suppress [Experimental] warnings on the OpenAI.Responses MCP surface and the
-// Microsoft.Extensions.AI experimental APIs.
-#pragma warning disable OPENAI001, MEAI001
+#pragma warning disable MEAI001, OPENAI001
 
-// Early-startup diagnostics — these write to stdout BEFORE App Insights is wired
-// so we can see boot failures even if telemetry export hasn't initialized.
+// Early-startup diagnostics — written to stdout BEFORE App Insights is wired so
+// we can see boot failures even if telemetry export hasn't initialized.
 Console.WriteLine("[startup] triage-agent booting...");
 foreach (var name in new[]
 {
@@ -46,49 +44,97 @@ try
     var credential = new Azure.Identity.DefaultAzureCredential();
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
 
-    // Build the GitHub MCP tool. The Foundry runtime executes MCP tool calls
-    // server-side using the PAT stored in the Custom-keys project connection
-    // (Authorization header = "Bearer <PAT>").
-    var mcpTool = ResponseTool.CreateMcpTool(
-        serverLabel: "github",
-        serverUri: new Uri("https://api.githubcopilot.com/mcp/"),
-        allowedTools: new McpToolFilter
-        {
-            ToolNames =
-            {
-                // We do NOT include issue_read — title + body are already in the
-                // invocation payload, so we save a tool round-trip and shrink the
-                // attack surface for prompt-injection.
-                "add_issue_comment",
-                "issue_write",
-                "label_write",
-                "get_label",
-            },
-        },
-        toolCallApprovalPolicy: new McpToolCallApprovalPolicy(
-            GlobalMcpToolCallApprovalPolicy.NeverRequireApproval));
-    mcpTool.ProjectConnectionId = mcpConnectionName;
-    Console.WriteLine("[startup] MCP tool built.");
-
-    // Create (or refresh) the persisted agent version that carries the MCP tool.
-    // NOTE: each cold start creates a new version. Acceptable for the demo; an
-    // M6 cleanup task should prune old versions. See plan.md.
-    var agentVersion = projectClient.AgentAdministrationClient
-        .CreateAgentVersionAsync(
-            "triage-agent",
-            new ProjectsAgentVersionCreationOptions(
-                new DeclarativeAgentDefinition(model: modelDeployment)
-                {
-                    Instructions = TriageInvocationHandler.SystemInstruction,
-                    Tools = { mcpTool },
-                }))
+    // Pull the GitHub PAT from the Foundry "Custom keys" project connection
+    // (key=Authorization, value=Bearer <PAT>). This keeps the secret entirely
+    // inside Foundry — never in env vars, never in code.
+    Console.WriteLine($"[startup] Reading connection '{mcpConnectionName}'...");
+    var connection = projectClient.Connections
+        .GetConnectionAsync(mcpConnectionName, includeCredentials: true)
         .GetAwaiter().GetResult();
-    Console.WriteLine($"[startup] Agent version created: {agentVersion.Value.Version}");
 
-    AIAgent triageAgent = projectClient.AsAIAgent(agentVersion.Value);
-    Console.WriteLine("[startup] AIAgent constructed (FoundryAgent, Responses API).");
+    if (connection.Value.Credentials is not AIProjectConnectionCustomCredential customCreds)
+    {
+        var actualType = connection.Value.Credentials?.GetType().FullName ?? "(null)";
+        throw new InvalidOperationException(
+            $"Connection '{mcpConnectionName}' credentials type is '{actualType}', expected CustomKeys.");
+    }
+
+    Console.WriteLine($"[startup] Connection has {customCreds.Keys.Count} key(s): [{string.Join(", ", customCreds.Keys.Keys)}]");
+
+    string? authHeader = null;
+    foreach (var kv in customCreds.Keys)
+    {
+        if (string.Equals(kv.Key, "Authorization", StringComparison.OrdinalIgnoreCase))
+        {
+            authHeader = kv.Value;
+            break;
+        }
+    }
+    if (string.IsNullOrWhiteSpace(authHeader))
+    {
+        throw new InvalidOperationException(
+            $"Connection '{mcpConnectionName}' does not contain an 'Authorization' key. Keys present: [{string.Join(", ", customCreds.Keys.Keys)}].");
+    }
+    Console.WriteLine($"[startup] PAT loaded from Foundry connection ({authHeader.Length} chars).");
+
+    // Connect to the GitHub remote MCP server (Streamable HTTP transport). The
+    // PAT travels only via the Authorization header on outbound HTTP calls.
+    Console.WriteLine("[startup] Connecting to GitHub MCP server...");
+    var transport = new HttpClientTransport(new HttpClientTransportOptions
+    {
+        Endpoint = new Uri("https://api.githubcopilot.com/mcp/"),
+        Name = "github-mcp",
+        TransportMode = HttpTransportMode.StreamableHttp,
+        AdditionalHeaders = new Dictionary<string, string>
+        {
+            ["Authorization"] = authHeader,
+        },
+    });
+
+    var mcpClient = McpClient.CreateAsync(transport).GetAwaiter().GetResult();
+    Console.WriteLine("[startup] MCP client connected.");
+
+    // List tools the server advertises and filter to just the ones we need.
+    // The model's allowlist matches what's referenced in the system prompt.
+    var allTools = mcpClient.ListToolsAsync().GetAwaiter().GetResult();
+    Console.WriteLine($"[startup] Server advertises {allTools.Count} tools.");
+
+    var allowedToolNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "add_issue_comment",
+        "create_issue_comment",   // alternative name on some server versions
+        "issue_write",
+        "update_issue",            // alternative name on some server versions
+        "label_write",
+        "create_label",            // alternative name on some server versions
+        "get_label",
+    };
+
+    var filteredTools = allTools
+        .Where(t => allowedToolNames.Contains(t.Name))
+        .Cast<AITool>()
+        .ToList();
+
+    Console.WriteLine($"[startup] Using {filteredTools.Count} filtered tools: {string.Join(", ", filteredTools.Select(t => t.Name))}");
+
+    if (filteredTools.Count == 0)
+    {
+        var sample = string.Join(", ", allTools.Take(15).Select(t => t.Name));
+        Console.WriteLine($"[startup] WARNING: zero tools matched the allowlist. First advertised tools: {sample}");
+    }
+
+    // ChatClientAgent wraps its IChatClient with FunctionInvokingChatClient
+    // automatically (UseProvidedChatClientAsIs defaults to false), so tool
+    // calls execute through the MCP client without any extra middleware.
+    ChatClientAgent triageAgent = projectClient.AsAIAgent(
+        model: modelDeployment,
+        instructions: TriageInvocationHandler.SystemInstruction,
+        name: "triage-agent",
+        tools: filteredTools);
+    Console.WriteLine("[startup] AIAgent constructed with MCP tools.");
 
     builder.Services.AddSingleton<AIAgent>(triageAgent);
+    builder.Services.AddSingleton(mcpClient);
     builder.Services.AddInvocationsServer();
     builder.Services.AddScoped<InvocationHandler, TriageInvocationHandler>();
 
@@ -106,4 +152,4 @@ catch (Exception ex)
     throw;
 }
 
-#pragma warning restore OPENAI001, MEAI001
+#pragma warning restore MEAI001, OPENAI001
