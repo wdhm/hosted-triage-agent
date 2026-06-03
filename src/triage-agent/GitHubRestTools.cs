@@ -202,8 +202,16 @@ public sealed class GitHubRestTools
         {
             (_counters.Value ??= new Counters()).CommentsPosted++;
             // Stash the just-created comment ID so the handler can PATCH it
-            // with the Foundry session marker after RunAsync returns.
-            _lastCommentId.Value = TryReadCommentId(result.Body);
+            // with the Foundry session marker after RunAsync returns. Prefer
+            // the Location header (rock-solid) and fall back to body parse.
+            var commentId = result.LocationCommentId ?? TryReadCommentId(result.Body, _logger);
+            if (commentId is null)
+            {
+                _logger.LogWarning(
+                    "Could not extract comment ID from POST response; Location={Location} bodyLen={BodyLen} bodyHead={Head}",
+                    result.Location ?? "(none)", result.Body?.Length ?? 0, Trunc(result.Body ?? "", 200));
+            }
+            _lastCommentId.Value = commentId;
         }
         else
         {
@@ -219,11 +227,11 @@ public sealed class GitHubRestTools
     /// on parse failure — the marker PATCH just gets skipped and the next
     /// turn starts a fresh conversation (no worse than today's behavior).
     /// </summary>
-    private static long? TryReadCommentId(string responseBody)
+    private static long? TryReadCommentId(string responseBody, ILogger logger)
     {
         if (string.IsNullOrWhiteSpace(responseBody))
         {
-            Console.WriteLine("[REST-DBG] TryReadCommentId: body is null/empty");
+            logger.LogWarning("TryReadCommentId: body is null/empty");
             return null;
         }
         try
@@ -231,30 +239,32 @@ public sealed class GitHubRestTools
             using var doc = JsonDocument.Parse(responseBody);
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
             {
-                Console.WriteLine($"[REST-DBG] TryReadCommentId: root is {doc.RootElement.ValueKind}, head={Trunc(responseBody, 200)}");
+                logger.LogWarning("TryReadCommentId: root is {Kind}, head={Head}",
+                    doc.RootElement.ValueKind, Trunc(responseBody, 200));
                 return null;
             }
             if (!doc.RootElement.TryGetProperty("id", out var idEl))
             {
                 var keys = string.Join(",", doc.RootElement.EnumerateObject().Take(15).Select(p => p.Name));
-                Console.WriteLine($"[REST-DBG] TryReadCommentId: no 'id' field; keys=[{keys}] bodyLen={responseBody.Length}");
+                logger.LogWarning("TryReadCommentId: no 'id' field; keys=[{Keys}] bodyLen={Len}",
+                    keys, responseBody.Length);
                 return null;
             }
             if (idEl.ValueKind != JsonValueKind.Number)
             {
-                Console.WriteLine($"[REST-DBG] TryReadCommentId: 'id' is {idEl.ValueKind} (raw={Trunc(idEl.GetRawText(), 100)})");
+                logger.LogWarning("TryReadCommentId: 'id' is {Kind} raw={Raw}", idEl.ValueKind, Trunc(idEl.GetRawText(), 100));
                 return null;
             }
             if (!idEl.TryGetInt64(out var id))
             {
-                Console.WriteLine($"[REST-DBG] TryReadCommentId: id not Int64 (raw={idEl.GetRawText()})");
+                logger.LogWarning("TryReadCommentId: id not Int64 (raw={Raw})", idEl.GetRawText());
                 return null;
             }
             return id;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[REST-DBG] TryReadCommentId: parse threw {ex.GetType().Name}: {ex.Message}; head={Trunc(responseBody, 200)}");
+            logger.LogWarning(ex, "TryReadCommentId: parse threw; head={Head}", Trunc(responseBody, 200));
             return null;
         }
     }
@@ -543,10 +553,26 @@ public sealed class GitHubRestTools
                 $"FAILED: {label} returned HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {Trunc(body, 800)}");
         }
         Console.WriteLine($"[REST-OK] {label}: HTTP {(int)resp.StatusCode}");
+        // Capture the Location header — for POST /comments, GitHub puts the
+        // canonical comment URL there ending in /comments/{id}. This is
+        // rock-solid for parsing the new comment ID and immune to body
+        // weirdness (compression, BOMs, large payloads, etc.).
+        string? location = null;
+        long? locationCommentId = null;
+        if (resp.Headers.Location is not null)
+        {
+            location = resp.Headers.Location.ToString();
+            var lastSlash = location.LastIndexOf('/');
+            if (lastSlash >= 0 && lastSlash < location.Length - 1
+                && long.TryParse(location[(lastSlash + 1)..], out var parsed))
+            {
+                locationCommentId = parsed;
+            }
+        }
         // Return FULL body on success — Wave 2's TryReadCommentId parses it for
         // the comment ID, and GitHub's comment response routinely exceeds 1500
         // chars once our trace footer + triage template are included.
-        return new RestResult(true, body);
+        return new RestResult(true, body, location, locationCommentId);
     }
 
     private static string StripBearer(string token) =>
@@ -557,7 +583,7 @@ public sealed class GitHubRestTools
     private static string Trunc(string s, int max) =>
         s.Length > max ? s[..max] + "...[truncated]" : s;
 
-    private sealed record RestResult(bool Success, string Body);
+    private sealed record RestResult(bool Success, string Body, string? Location = null, long? LocationCommentId = null);
 
     public sealed class Counters
     {
