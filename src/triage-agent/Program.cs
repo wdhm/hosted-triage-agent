@@ -2,7 +2,6 @@ using Azure.AI.AgentServer.Invocations;
 using Azure.AI.Projects;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
-using ModelContextProtocol.Client;
 using TriageAgent;
 
 #pragma warning disable MEAI001, OPENAI001
@@ -15,7 +14,7 @@ foreach (var name in new[]
     "AZURE_AI_PROJECT_ENDPOINT",
     "FOUNDRY_PROJECT_ENDPOINT",
     "TRIAGE_MODEL_DEPLOYMENT",
-    "GITHUB_MCP_CONNECTION_NAME",
+    "GITHUB_PAT_CONNECTION_NAME",
     "APPLICATIONINSIGHTS_CONNECTION_STRING",
     "HOME",
 })
@@ -35,12 +34,17 @@ try
             "Neither AZURE_AI_PROJECT_ENDPOINT nor FOUNDRY_PROJECT_ENDPOINT is set.");
     var modelDeployment = Environment.GetEnvironmentVariable("TRIAGE_MODEL_DEPLOYMENT")
         ?? "gpt-5-mini";
-    var mcpConnectionName = Environment.GetEnvironmentVariable("GITHUB_MCP_CONNECTION_NAME")
+    // Foundry connection holding the fallback PAT (key="Authorization",
+    // value="Bearer <pat>"). Used only when no per-request App token is
+    // present (e.g. direct CLI invocation). Production runs through the
+    // workflow which mints a fresh GitHub App installation token per call.
+    var patConnectionName = Environment.GetEnvironmentVariable("GITHUB_PAT_CONNECTION_NAME")
+        ?? Environment.GetEnvironmentVariable("GITHUB_MCP_CONNECTION_NAME") // legacy name
         ?? "github-pat-connection";
 
     Console.WriteLine($"[startup] Using project endpoint: {projectEndpoint}");
     Console.WriteLine($"[startup] Using model deployment: {modelDeployment}");
-    Console.WriteLine($"[startup] Using MCP connection: {mcpConnectionName}");
+    Console.WriteLine($"[startup] Using PAT fallback connection: {patConnectionName}");
 
     var credential = new Azure.Identity.DefaultAzureCredential();
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
@@ -48,16 +52,16 @@ try
     // Pull the GitHub PAT from the Foundry "Custom keys" project connection
     // (key=Authorization, value=Bearer <PAT>). This keeps the secret entirely
     // inside Foundry — never in env vars, never in code.
-    Console.WriteLine($"[startup] Reading connection '{mcpConnectionName}'...");
+    Console.WriteLine($"[startup] Reading connection '{patConnectionName}'...");
     var connection = projectClient.Connections
-        .GetConnectionAsync(mcpConnectionName, includeCredentials: true)
+        .GetConnectionAsync(patConnectionName, includeCredentials: true)
         .GetAwaiter().GetResult();
 
     if (connection.Value.Credentials is not AIProjectConnectionCustomCredential customCreds)
     {
         var actualType = connection.Value.Credentials?.GetType().FullName ?? "(null)";
         throw new InvalidOperationException(
-            $"Connection '{mcpConnectionName}' credentials type is '{actualType}', expected CustomKeys.");
+            $"Connection '{patConnectionName}' credentials type is '{actualType}', expected CustomKeys.");
     }
 
     Console.WriteLine($"[startup] Connection has {customCreds.Keys.Count} key(s): [{string.Join(", ", customCreds.Keys.Keys)}]");
@@ -74,7 +78,7 @@ try
     if (string.IsNullOrWhiteSpace(authHeader))
     {
         throw new InvalidOperationException(
-            $"Connection '{mcpConnectionName}' does not contain an 'Authorization' key. Keys present: [{string.Join(", ", customCreds.Keys.Keys)}].");
+            $"Connection '{patConnectionName}' does not contain an 'Authorization' key. Keys present: [{string.Join(", ", customCreds.Keys.Keys)}].");
     }
     // Strip optional "Bearer " prefix — the DynamicAuthHandler re-adds it.
     var fallbackToken = authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
@@ -84,87 +88,26 @@ try
 
     // GitHub identity strategy:
     //   - Preferred path (production): workflow mints a GitHub App installation
-    //     token per run and sends it as `X-GitHub-Token` on the invocation POST.
-    //     TriageInvocationHandler pushes it onto GitHubTokenProvider's AsyncLocal,
-    //     DynamicAuthHandler stamps it on every outbound MCP HTTP call. The
-    //     agent then posts/labels as `<app>[bot]` with its own identity.
+    //     token per run and sends it in the JSON body field `github_token`.
+    //     TriageInvocationHandler pushes it onto GitHubTokenProvider's AsyncLocal.
+    //     GitHubRestTools.SendAsync reads it for every outbound GitHub REST call,
+    //     so the agent posts/labels as `<app>[bot]` with its own identity.
     //   - Fallback path (CLI / local testing): the PAT from the Foundry
     //     connection above is used. Lets us invoke without a workflow.
     var tokenProvider = new GitHubTokenProvider(fallbackToken);
 
-    // Connect to the GitHub remote MCP server (Streamable HTTP transport). The
-    // DynamicAuthHandler injects the per-request token (or fallback PAT) onto
-    // every outbound HTTP call — both the initial handshake (uses fallback) and
-    // per-tool-invocation calls (use AsyncLocal token from the request).
-    Console.WriteLine("[startup] Connecting to GitHub MCP server...");
-    var dynamicHandler = new DynamicAuthHandler(
+    // GitHub write tools, called via REST (api.github.com) — NOT the Copilot MCP
+    // server. See GitHubRestTools.cs for the full rationale (MCP session-id
+    // staleness + the get_me/403 trap for App installation tokens).
+    var restTools = new GitHubRestTools(
         tokenProvider,
-        Microsoft.Extensions.Logging.Abstractions.NullLogger<DynamicAuthHandler>.Instance)
-    {
-        InnerHandler = new HttpClientHandler(),
-    };
-    var mcpHttpClient = new HttpClient(dynamicHandler);
-    var transport = new HttpClientTransport(
-        new HttpClientTransportOptions
-        {
-            Endpoint = new Uri("https://api.githubcopilot.com/mcp/"),
-            Name = "github-mcp",
-            TransportMode = HttpTransportMode.StreamableHttp,
-            // No AdditionalHeaders["Authorization"] — DynamicAuthHandler owns it.
-        },
-        httpClient: mcpHttpClient,
-        loggerFactory: null,
-        ownsHttpClient: true);
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<GitHubRestTools>.Instance);
 
-    var mcpClient = McpClient.CreateAsync(transport).GetAwaiter().GetResult();
-    Console.WriteLine("[startup] MCP client connected.");
-
-    var allTools = mcpClient.ListToolsAsync().GetAwaiter().GetResult();
-    Console.WriteLine($"[startup] Server advertises {allTools.Count} tools.");
-
-    // ── Two agents, two tool allowlists ──────────────────────────────────────
-    // triageAgent  : posts comment + applies labels (issue.opened path)
-    // followupAgent: posts comment only (issue_comment.created path) — narrower
-    //                blast radius so a follow-up can't accidentally re-label.
-
-    var triageToolNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "add_issue_comment",
-        "create_issue_comment",
-        "issue_write",
-        "update_issue",
-        "label_write",
-        "create_label",
-        "get_label",
-    };
-
-    var followupToolNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "add_issue_comment",
-        "create_issue_comment",
-    };
-
-    var triageTools = allTools.Where(t => triageToolNames.Contains(t.Name))
-        .Cast<AITool>().ToList();
-    var followupTools = allTools.Where(t => followupToolNames.Contains(t.Name))
-        .Cast<AITool>().ToList();
+    var triageTools = restTools.TriageTools();
+    var followupTools = restTools.FollowupTools();
 
     Console.WriteLine($"[startup] Triage tools ({triageTools.Count}): {string.Join(", ", triageTools.Select(t => t.Name))}");
     Console.WriteLine($"[startup] Follow-up tools ({followupTools.Count}): {string.Join(", ", followupTools.Select(t => t.Name))}");
-
-    // Fail-fast guards — startup should not succeed if the server's tool surface
-    // has drifted away from what our prompts assume.
-    bool HasAny(IEnumerable<AITool> tools, params string[] names) =>
-        tools.Any(t => names.Contains(t.Name, StringComparer.OrdinalIgnoreCase));
-
-    if (!HasAny(triageTools, "add_issue_comment", "create_issue_comment"))
-        throw new InvalidOperationException("GitHub MCP server is missing a comment-post tool (add_issue_comment / create_issue_comment).");
-    if (!HasAny(triageTools, "issue_write", "update_issue"))
-        throw new InvalidOperationException("GitHub MCP server is missing an issue-update tool (issue_write / update_issue).");
-    if (!HasAny(triageTools, "get_label"))
-        throw new InvalidOperationException("GitHub MCP server is missing the get_label tool.");
-    if (!HasAny(followupTools, "add_issue_comment", "create_issue_comment"))
-        throw new InvalidOperationException("Follow-up agent has no comment-post tool wired.");
 
     ChatClientAgent triageAgent = projectClient.AsAIAgent(
         model: modelDeployment,
@@ -181,7 +124,7 @@ try
     Console.WriteLine("[startup] Both agents constructed.");
 
     builder.Services.AddSingleton(tokenProvider);
-    builder.Services.AddSingleton(mcpClient);
+    builder.Services.AddSingleton(restTools);
     builder.Services.AddSingleton(new AgentBundle(triageAgent, followupAgent));
     builder.Services.AddSingleton<FoundrySessionStore>(sp =>
         new FoundrySessionStore(

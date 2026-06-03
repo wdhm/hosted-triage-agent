@@ -1,4 +1,3 @@
-using System.Net.Http.Headers;
 using Microsoft.Extensions.Logging;
 
 namespace TriageAgent;
@@ -6,9 +5,10 @@ namespace TriageAgent;
 /// <summary>
 /// Per-request GitHub token provider. The invocation handler pushes the
 /// per-call installation token (minted by the GitHub App in the workflow);
-/// the MCP HTTP client's <see cref="DynamicAuthHandler"/> reads it and stamps
-/// it on outbound MCP requests. Falls back to the static PAT from the Foundry
-/// connection if no per-request token is set (direct CLI testing path).
+/// <see cref="GitHubRestTools"/> reads it via <see cref="GetToken"/> and
+/// stamps it on every outbound REST call to api.github.com. Falls back to
+/// the static PAT from the Foundry connection if no per-request token is
+/// set (direct CLI testing path).
 /// </summary>
 public sealed class GitHubTokenProvider
 {
@@ -35,29 +35,3 @@ public sealed class GitHubTokenProvider
     }
 }
 
-/// <summary>
-/// Stamps <c>Authorization: Bearer &lt;token&gt;</c> onto every outbound HTTP
-/// request using the current value from <see cref="GitHubTokenProvider"/>.
-/// </summary>
-public sealed class DynamicAuthHandler(
-    GitHubTokenProvider provider,
-    ILogger<DynamicAuthHandler> logger) : DelegatingHandler
-{
-    protected override async Task<HttpResponseMessage> SendAsync(
-        HttpRequestMessage request, CancellationToken cancellationToken)
-    {
-        var token = provider.GetToken();
-        if (!string.IsNullOrEmpty(token))
-        {
-            request.Headers.Authorization =
-                token.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
-                    ? AuthenticationHeaderValue.Parse(token)
-                    : new AuthenticationHeaderValue("Bearer", token);
-        }
-        else
-        {
-            logger.LogWarning("No GitHub token available for outbound MCP request to {Url}", request.RequestUri);
-        }
-        return await base.SendAsync(request, cancellationToken);
-    }
-}
