@@ -5,16 +5,31 @@ using Microsoft.Agents.AI;
 namespace TriageAgent;
 
 /// <summary>
-/// Persists <see cref="AgentSession"/> JSON keyed by Foundry session ID.
-/// The JSON is tiny (~100 bytes — just the ConversationId pointer). Conversation
-/// history itself lives on Foundry's side, keyed by ConversationId.
+/// Persists the **Foundry conversation pointer** for an issue. NOT a copy of
+/// the conversation — the actual messages, system prompts, tool calls, and
+/// model responses all live server-side on Foundry's Responses API and are
+/// chained via <c>previous_response_id</c>. This file only contains the
+/// ~24-byte <c>ConversationId</c> that points at the server-side conversation.
 ///
-/// State is written under <c>$HOME/sessions/</c>, which Foundry checkpoints and
-/// restores across 15-min idle scale-to-zero. Up to 30-day session lifetime.
+/// Why this design matters for the Hosted-Agents pitch:
+///   • <b>Scale-to-zero survival</b>. The container can idle for 15 min and
+///     get torn down. The actual conversation isn't here — it's on Foundry's
+///     server. On cold-start, the pointer is read from <c>$HOME/sessions/</c>
+///     (Foundry's persistent container HOME, kept for the session lifetime,
+///     up to 30 days) and the next <c>RunAsync</c> resumes the thread with
+///     a single hop to the Responses API.
+///   • <b>Version-rollout survival</b>. <c>previous_response_id</c> is
+///     project-scoped, not version-scoped — when we deploy v22 over v21, the
+///     same pointer still resolves and the new agent version keeps talking
+///     to the same conversation.
+///   • <b>No external memory store</b>. No Redis, no Cosmos, no SQL. On
+///     App Service / Container Apps we'd be wiring one of those plus
+///     handling reconnects and TTLs ourselves.
 ///
-/// Writes are atomic (write to .tmp then rename) so a crash mid-write can't
-/// corrupt the JSON. Per-session concurrency is enforced at the workflow level
-/// via a GitHub Actions concurrency group; we don't add an in-process lock.
+/// Writes are atomic (write to <c>.tmp</c>, then rename) so a crash mid-write
+/// can't corrupt the pointer JSON. Per-issue concurrency is enforced at the
+/// workflow level via a GitHub Actions concurrency group; we don't add an
+/// in-process lock here.
 /// </summary>
 public sealed class FoundrySessionStore(
     AIAgent agent,

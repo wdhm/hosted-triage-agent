@@ -1,7 +1,11 @@
 using Azure.AI.AgentServer.Invocations;
 using Azure.AI.Projects;
+using Azure.Monitor.OpenTelemetry.Exporter;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
+using OpenTelemetry;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using TriageAgent;
 
 #pragma warning disable MEAI001, OPENAI001
@@ -131,21 +135,76 @@ try
         name: "triage-agent-followup",
         tools: followupTools);
 
-    Console.WriteLine("[startup] Both agents constructed.");
+    // Wrap both agents with OpenTelemetry so RunAsync emits invoke_agent spans
+    // and the inner MEAI chat client emits gen_ai.chat + execute_tool spans.
+    // This is required on the IAgentInvocationHandler path — unlike
+    // AddFoundryResponses, this path does NOT auto-wrap. The source name here
+    // must match an AddSource("Experimental.Microsoft.Agents.AI") below.
+    // EnableSensitiveData stays false (default) — token counts + latency are
+    // exported, raw prompts / completions / tool args are NOT.
+    AIAgent triageAgentOtel = triageAgent.AsBuilder()
+        .UseOpenTelemetry(sourceName: "Experimental.Microsoft.Agents.AI")
+        .Build();
+    AIAgent followupAgentOtel = followupAgent.AsBuilder()
+        .UseOpenTelemetry(sourceName: "Experimental.Microsoft.Agents.AI")
+        .Build();
+
+    Console.WriteLine("[startup] Both agents constructed and OpenTelemetry-wrapped.");
 
     builder.Services.AddSingleton(tokenProvider);
     builder.Services.AddSingleton(restTools);
-    builder.Services.AddSingleton(new AgentBundle(triageAgent, followupAgent));
+    builder.Services.AddSingleton(new AgentBundle(triageAgentOtel, followupAgentOtel));
     builder.Services.AddSingleton<FoundrySessionStore>(sp =>
         new FoundrySessionStore(
-            // session store binds to followupAgent because both agents share the
-            // same underlying Foundry thread model — serialize/deserialize works
-            // identically on either, but we pick the narrower agent to make it
-            // obvious that the store isn't tool-aware.
-            sp.GetRequiredService<AgentBundle>().Followup,
+            // Bind to the unwrapped ChatClientAgent so session (de)serialization
+            // is independent of the OpenTelemetry decorator. The bundle holds
+            // the wrapped versions for RunAsync; we keep this concern separate.
+            followupAgent,
             sp.GetRequiredService<ILogger<FoundrySessionStore>>()));
     builder.Services.AddInvocationsServer();
     builder.Services.AddScoped<InvocationHandler, TriageInvocationHandler>();
+
+    // ── OpenTelemetry → App Insights ───────────────────────────────────────
+    // Foundry auto-injects APPLICATIONINSIGHTS_CONNECTION_STRING into the
+    // container. Sources registered here MUST match the ones the runtime
+    // actually emits on (verified against microsoft/agent-framework + MEAI
+    // source). On the IAgentInvocationHandler path:
+    //   - "Experimental.Microsoft.Agents.AI"      → invoke_agent spans
+    //     (emitted only because we explicitly wrap each agent with
+    //     UseOpenTelemetry above — AddFoundryResponses would auto-wrap, the
+    //     invocations path does not).
+    //   - "Experimental.Microsoft.Extensions.AI"  → per-LLM-call gen_ai.chat
+    //     spans + execute_tool <name> spans (model, prompt/completion
+    //     tokens, latency; raw text excluded — EnableSensitiveData=false).
+    //   - "Azure.AI.AgentServer.Invocations"      → baggage propagation from
+    //     the invocations endpoint handler (no span itself in beta.4).
+    //   - "TriageAgent.Tools"                     → explicit tool spans we
+    //     emit inside GitHubRestTools as a belt-and-braces guarantee that
+    //     the demo always shows the REST calls in the trace tree.
+    //   - AddAspNetCoreInstrumentation()          → inbound request span
+    //     (this is the root of each end-to-end trace; without it, the
+    //     KQL `requests` row is empty for our invocations).
+    //   - AddHttpClientInstrumentation()          → outbound HTTP to Azure
+    //     OpenAI and api.github.com.
+    var aiConnStr = Environment.GetEnvironmentVariable("APPLICATIONINSIGHTS_CONNECTION_STRING");
+    if (!string.IsNullOrWhiteSpace(aiConnStr))
+    {
+        Console.WriteLine($"[startup] App Insights connection string present ({aiConnStr.Length} chars) — wiring OpenTelemetry exporter.");
+        builder.Services.AddOpenTelemetry()
+            .ConfigureResource(r => r.AddService("triage-agent", serviceVersion: "1.0"))
+            .WithTracing(t => t
+                .AddSource("Experimental.Microsoft.Agents.AI")
+                .AddSource("Experimental.Microsoft.Extensions.AI")
+                .AddSource("Azure.AI.AgentServer.Invocations")
+                .AddSource(GitHubRestTools.ActivitySourceName)
+                .AddAspNetCoreInstrumentation()
+                .AddHttpClientInstrumentation()
+                .AddAzureMonitorTraceExporter(o => o.ConnectionString = aiConnStr));
+    }
+    else
+    {
+        Console.WriteLine("[startup] APPLICATIONINSIGHTS_CONNECTION_STRING not set — telemetry export disabled. Spans still emit locally and surface in logs.");
+    }
 
     builder.RegisterProtocol("invocations", endpoints => endpoints.MapInvocationsServer());
 
