@@ -14,6 +14,18 @@
     <PackageReference Include="Azure.AI.AgentServer.Invocations" Version="1.0.0-beta.4" />
     <PackageReference Include="Azure.AI.Projects" Version="2.1.0-beta.1" />
     <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.5.0" />
+    <!-- OpenTelemetry: we deliberately reference ONLY Extensions.Hosting (so we
+         can call builder.Services.AddOpenTelemetry().WithTracing(...)). All other
+         OTel packages — Api, Sdk, Instrumentation.Http, Instrumentation.AspNetCore,
+         and Azure.Monitor.OpenTelemetry.Exporter — are brought in TRANSITIVELY by
+         Foundry's Microsoft.Agents.AI.Foundry.Hosting at the exact versions its
+         internal UseAzureMonitor() call expects (the binding is by assembly
+         version, not semver). Referencing them ourselves with different versions
+         caused FileNotFoundException at AgentHostBuilder.Build() and the container
+         never reached readiness (HTTP 424 session_not_ready). We do NOT call
+         AddAzureMonitorTraceExporter ourselves — Foundry wires the exporter; we
+         only layer .AddSource(...) registrations onto the same TracerProvider. -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.13.0" />
   </ItemGroup>
 
 </Project>

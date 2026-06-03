@@ -203,9 +203,11 @@ public sealed class TriageInvocationHandler(
         // Reset per-invocation tool-call counters so the post-run check is
         // scoped to this request only (AsyncLocal-based).
         using var _toolScope = restTools.BeginInvocation();
+        var traceId = restTools.CurrentTraceId();
         logger.LogInformation(
-            "Per-request GitHub token: source={Source}",
-            string.IsNullOrWhiteSpace(payload.GithubToken) ? "static-PAT-fallback" : "github-app-installation");
+            "Per-request GitHub token: source={Source} traceId={TraceId}",
+            string.IsNullOrWhiteSpace(payload.GithubToken) ? "static-PAT-fallback" : "github-app-installation",
+            traceId ?? "(no-otel)");
 
         // ── Event-specific validation ──────────────────────────────────────
         if (eventType == "issue_comment.created"
