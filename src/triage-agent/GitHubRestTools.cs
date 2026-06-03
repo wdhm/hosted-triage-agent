@@ -221,14 +221,42 @@ public sealed class GitHubRestTools
     /// </summary>
     private static long? TryReadCommentId(string responseBody)
     {
+        if (string.IsNullOrWhiteSpace(responseBody))
+        {
+            Console.WriteLine("[REST-DBG] TryReadCommentId: body is null/empty");
+            return null;
+        }
         try
         {
             using var doc = JsonDocument.Parse(responseBody);
-            if (doc.RootElement.TryGetProperty("id", out var idEl) && idEl.TryGetInt64(out var id))
-                return id;
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                Console.WriteLine($"[REST-DBG] TryReadCommentId: root is {doc.RootElement.ValueKind}, head={Trunc(responseBody, 200)}");
+                return null;
+            }
+            if (!doc.RootElement.TryGetProperty("id", out var idEl))
+            {
+                var keys = string.Join(",", doc.RootElement.EnumerateObject().Take(15).Select(p => p.Name));
+                Console.WriteLine($"[REST-DBG] TryReadCommentId: no 'id' field; keys=[{keys}] bodyLen={responseBody.Length}");
+                return null;
+            }
+            if (idEl.ValueKind != JsonValueKind.Number)
+            {
+                Console.WriteLine($"[REST-DBG] TryReadCommentId: 'id' is {idEl.ValueKind} (raw={Trunc(idEl.GetRawText(), 100)})");
+                return null;
+            }
+            if (!idEl.TryGetInt64(out var id))
+            {
+                Console.WriteLine($"[REST-DBG] TryReadCommentId: id not Int64 (raw={idEl.GetRawText()})");
+                return null;
+            }
+            return id;
         }
-        catch { /* fall through to null */ }
-        return null;
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[REST-DBG] TryReadCommentId: parse threw {ex.GetType().Name}: {ex.Message}; head={Trunc(responseBody, 200)}");
+            return null;
+        }
     }
 
     [Description("Replace the labels on a GitHub issue with the provided list. Missing labels are auto-created.")]
