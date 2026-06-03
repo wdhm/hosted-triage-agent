@@ -2,7 +2,6 @@ using Azure.AI.AgentServer.Invocations;
 using Azure.AI.Projects;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
-using OpenTelemetry;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using TriageAgent;
@@ -185,11 +184,12 @@ try
     //   - "TriageAgent.Tools"                     → explicit tool spans we
     //     emit inside GitHubRestTools as a belt-and-braces guarantee that
     //     the demo always shows the REST calls in the trace tree.
-    //   - AddAspNetCoreInstrumentation()          → inbound request span
-    //     (this is the root of each end-to-end trace; without it, the
-    //     KQL `requests` row is empty for our invocations).
-    //   - AddHttpClientInstrumentation()          → outbound HTTP to Azure
-    //     OpenAI and api.github.com.
+    //
+    // We do NOT call AddAspNetCoreInstrumentation() or AddHttpClientInstrumentation()
+    // ourselves — Foundry's UseAzureMonitor already registers both at the exact
+    // package versions its runtime bound to. Pulling in our own
+    // OpenTelemetry.Instrumentation.* packages caused FileNotFoundException at
+    // AgentHostBuilder.Build() and the container never reached readiness.
     Console.WriteLine("[startup] Layering OpenTelemetry sources onto Foundry's TracerProvider.");
     builder.Services.AddOpenTelemetry()
         .ConfigureResource(r => r.AddService("triage-agent", serviceVersion: "1.0"))
@@ -197,9 +197,7 @@ try
             .AddSource("Experimental.Microsoft.Agents.AI")
             .AddSource("Experimental.Microsoft.Extensions.AI")
             .AddSource("Azure.AI.AgentServer.Invocations")
-            .AddSource(GitHubRestTools.ActivitySourceName)
-            .AddAspNetCoreInstrumentation()
-            .AddHttpClientInstrumentation());
+            .AddSource(GitHubRestTools.ActivitySourceName));
 
     builder.RegisterProtocol("invocations", endpoints => endpoints.MapInvocationsServer());
 
