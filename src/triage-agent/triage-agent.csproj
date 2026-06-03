@@ -18,7 +18,13 @@
     <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.13.0" />
     <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.13.0" />
     <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.13.0" />
-    <PackageReference Include="Azure.Monitor.OpenTelemetry.Exporter" Version="1.5.0" />
+    <!-- Pinned to match the version Foundry's AgentHostBuilder.UseAzureMonitor
+         loads internally. A lower version causes a FileNotFoundException at
+         Build() time and the container never reaches readiness. We do NOT
+         call AddAzureMonitorTraceExporter ourselves — Foundry already wires
+         the exporter; we only layer source registrations onto the same
+         OpenTelemetryBuilder. -->
+    <PackageReference Include="Azure.Monitor.OpenTelemetry.Exporter" Version="1.7.0" />
   </ItemGroup>
 
 </Project>

@@ -1,6 +1,5 @@
 using Azure.AI.AgentServer.Invocations;
 using Azure.AI.Projects;
-using Azure.Monitor.OpenTelemetry.Exporter;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using OpenTelemetry;
@@ -164,11 +163,16 @@ try
     builder.Services.AddInvocationsServer();
     builder.Services.AddScoped<InvocationHandler, TriageInvocationHandler>();
 
-    // ── OpenTelemetry → App Insights ───────────────────────────────────────
-    // Foundry auto-injects APPLICATIONINSIGHTS_CONNECTION_STRING into the
-    // container. Sources registered here MUST match the ones the runtime
-    // actually emits on (verified against microsoft/agent-framework + MEAI
-    // source). On the IAgentInvocationHandler path:
+    // ── OpenTelemetry source registration ─────────────────────────────────
+    // Foundry's AgentHostBuilder already wires the Azure Monitor exporter
+    // internally (it calls UseAzureMonitor in Build()). We layer source
+    // registrations onto the SAME OpenTelemetryBuilder so our spans flow
+    // to the same App Insights resource — do NOT call AddAzureMonitorTraceExporter
+    // here, that would create a second exporter and double-publish.
+    //
+    // Sources MUST match what the runtime actually emits on (verified against
+    // microsoft/agent-framework + MEAI source). On the IAgentInvocationHandler
+    // path:
     //   - "Experimental.Microsoft.Agents.AI"      → invoke_agent spans
     //     (emitted only because we explicitly wrap each agent with
     //     UseOpenTelemetry above — AddFoundryResponses would auto-wrap, the
@@ -186,25 +190,16 @@ try
     //     KQL `requests` row is empty for our invocations).
     //   - AddHttpClientInstrumentation()          → outbound HTTP to Azure
     //     OpenAI and api.github.com.
-    var aiConnStr = Environment.GetEnvironmentVariable("APPLICATIONINSIGHTS_CONNECTION_STRING");
-    if (!string.IsNullOrWhiteSpace(aiConnStr))
-    {
-        Console.WriteLine($"[startup] App Insights connection string present ({aiConnStr.Length} chars) — wiring OpenTelemetry exporter.");
-        builder.Services.AddOpenTelemetry()
-            .ConfigureResource(r => r.AddService("triage-agent", serviceVersion: "1.0"))
-            .WithTracing(t => t
-                .AddSource("Experimental.Microsoft.Agents.AI")
-                .AddSource("Experimental.Microsoft.Extensions.AI")
-                .AddSource("Azure.AI.AgentServer.Invocations")
-                .AddSource(GitHubRestTools.ActivitySourceName)
-                .AddAspNetCoreInstrumentation()
-                .AddHttpClientInstrumentation()
-                .AddAzureMonitorTraceExporter(o => o.ConnectionString = aiConnStr));
-    }
-    else
-    {
-        Console.WriteLine("[startup] APPLICATIONINSIGHTS_CONNECTION_STRING not set — telemetry export disabled. Spans still emit locally and surface in logs.");
-    }
+    Console.WriteLine("[startup] Layering OpenTelemetry sources onto Foundry's TracerProvider.");
+    builder.Services.AddOpenTelemetry()
+        .ConfigureResource(r => r.AddService("triage-agent", serviceVersion: "1.0"))
+        .WithTracing(t => t
+            .AddSource("Experimental.Microsoft.Agents.AI")
+            .AddSource("Experimental.Microsoft.Extensions.AI")
+            .AddSource("Azure.AI.AgentServer.Invocations")
+            .AddSource(GitHubRestTools.ActivitySourceName)
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation());
 
     builder.RegisterProtocol("invocations", endpoints => endpoints.MapInvocationsServer());
 
