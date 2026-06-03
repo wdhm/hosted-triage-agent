@@ -137,9 +137,12 @@ public sealed class GitHubRestTools
     /// <summary>
     /// GitHub comment ID of the last comment <see cref="AddIssueCommentAsync"/>
     /// posted on this turn. Used by the handler to PATCH the comment with the
-    /// Foundry conversation pointer after RunAsync succeeds.
+    /// Foundry conversation pointer after RunAsync succeeds. Stored on the
+    /// shared Counters reference (not via AsyncLocal slot assignment) so that
+    /// writes from inside FunctionInvokingChatClient's tool dispatch flow
+    /// back to the handler's ExecutionContext.
     /// </summary>
-    public long? LastPostedCommentId => _lastCommentId.Value;
+    public long? LastPostedCommentId => _counters.Value?.LastCommentId;
 
     private static bool IsValidTraceId(string? t) =>
         !string.IsNullOrEmpty(t) && t != "00000000000000000000000000000000";
@@ -212,6 +215,13 @@ public sealed class GitHubRestTools
                     result.Location ?? "(none)", result.Body?.Length ?? 0, Trunc(result.Body ?? "", 200));
             }
             _lastCommentId.Value = commentId;
+            // Also stash on the shared Counters object — AsyncLocal slot
+            // writes inside FunctionInvokingChatClient's tool dispatch don't
+            // propagate back to the handler's ExecutionContext, but mutations
+            // to a shared reference do. This is the channel the handler
+            // actually reads via LastPostedCommentId.
+            if (commentId is not null && _counters.Value is { } c)
+                c.LastCommentId = commentId;
         }
         else
         {
@@ -589,6 +599,7 @@ public sealed class GitHubRestTools
     {
         public int CommentsPosted;
         public int LabelsSet;
+        public long? LastCommentId;
     }
 
     private sealed class Restore(Action onDispose) : IDisposable
