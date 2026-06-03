@@ -34,57 +34,66 @@ try
             "Neither AZURE_AI_PROJECT_ENDPOINT nor FOUNDRY_PROJECT_ENDPOINT is set.");
     var modelDeployment = Environment.GetEnvironmentVariable("TRIAGE_MODEL_DEPLOYMENT")
         ?? "gpt-5-mini";
-    // Foundry connection holding the fallback PAT (key="Authorization",
+    // Foundry connection holding a fallback PAT (key="Authorization",
     // value="Bearer <pat>"). Used only when no per-request App token is
-    // present (e.g. direct CLI invocation). Production runs through the
-    // workflow which mints a fresh GitHub App installation token per call.
+    // present (e.g. direct CLI invocation without the workflow). Production
+    // runs through the workflow which mints a fresh GitHub App installation
+    // token per call, so this connection is OPTIONAL — if absent, startup
+    // succeeds with a null fallback and direct CLI invocations will simply
+    // fail with "no GitHub token in scope" instead of a startup crash.
     var patConnectionName = Environment.GetEnvironmentVariable("GITHUB_PAT_CONNECTION_NAME")
         ?? Environment.GetEnvironmentVariable("GITHUB_MCP_CONNECTION_NAME") // legacy name
         ?? "github-pat-connection";
 
     Console.WriteLine($"[startup] Using project endpoint: {projectEndpoint}");
     Console.WriteLine($"[startup] Using model deployment: {modelDeployment}");
-    Console.WriteLine($"[startup] Using PAT fallback connection: {patConnectionName}");
+    Console.WriteLine($"[startup] PAT fallback connection (optional): {patConnectionName}");
 
     var credential = new Azure.Identity.DefaultAzureCredential();
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
 
-    // Pull the GitHub PAT from the Foundry "Custom keys" project connection
-    // (key=Authorization, value=Bearer <PAT>). This keeps the secret entirely
-    // inside Foundry — never in env vars, never in code.
-    Console.WriteLine($"[startup] Reading connection '{patConnectionName}'...");
-    var connection = projectClient.Connections
-        .GetConnectionAsync(patConnectionName, includeCredentials: true)
-        .GetAwaiter().GetResult();
-
-    if (connection.Value.Credentials is not AIProjectConnectionCustomCredential customCreds)
+    string? fallbackToken = null;
+    try
     {
-        var actualType = connection.Value.Credentials?.GetType().FullName ?? "(null)";
-        throw new InvalidOperationException(
-            $"Connection '{patConnectionName}' credentials type is '{actualType}', expected CustomKeys.");
-    }
+        Console.WriteLine($"[startup] Attempting to read fallback PAT from connection '{patConnectionName}'...");
+        var connection = projectClient.Connections
+            .GetConnectionAsync(patConnectionName, includeCredentials: true)
+            .GetAwaiter().GetResult();
 
-    Console.WriteLine($"[startup] Connection has {customCreds.Keys.Count} key(s): [{string.Join(", ", customCreds.Keys.Keys)}]");
-
-    string? authHeader = null;
-    foreach (var kv in customCreds.Keys)
-    {
-        if (string.Equals(kv.Key, "Authorization", StringComparison.OrdinalIgnoreCase))
+        if (connection.Value.Credentials is AIProjectConnectionCustomCredential customCreds)
         {
-            authHeader = kv.Value;
-            break;
+            Console.WriteLine($"[startup] Connection has {customCreds.Keys.Count} key(s): [{string.Join(", ", customCreds.Keys.Keys)}]");
+            string? authHeader = null;
+            foreach (var kv in customCreds.Keys)
+            {
+                if (string.Equals(kv.Key, "Authorization", StringComparison.OrdinalIgnoreCase))
+                {
+                    authHeader = kv.Value;
+                    break;
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(authHeader))
+            {
+                fallbackToken = authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+                    ? authHeader["Bearer ".Length..].Trim()
+                    : authHeader.Trim();
+                Console.WriteLine($"[startup] Fallback PAT loaded ({fallbackToken.Length} chars).");
+            }
+            else
+            {
+                Console.WriteLine($"[startup] Connection has no 'Authorization' key — running without PAT fallback.");
+            }
+        }
+        else
+        {
+            var actualType = connection.Value.Credentials?.GetType().FullName ?? "(null)";
+            Console.WriteLine($"[startup] Connection credentials type is '{actualType}' (expected CustomKeys) — running without PAT fallback.");
         }
     }
-    if (string.IsNullOrWhiteSpace(authHeader))
+    catch (Exception ex)
     {
-        throw new InvalidOperationException(
-            $"Connection '{patConnectionName}' does not contain an 'Authorization' key. Keys present: [{string.Join(", ", customCreds.Keys.Keys)}].");
+        Console.WriteLine($"[startup] PAT connection unavailable ({ex.GetType().Name}: {ex.Message}) — running without PAT fallback. Direct CLI invocations will fail; workflow path is unaffected.");
     }
-    // Strip optional "Bearer " prefix — the DynamicAuthHandler re-adds it.
-    var fallbackToken = authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
-        ? authHeader["Bearer ".Length..].Trim()
-        : authHeader.Trim();
-    Console.WriteLine($"[startup] Fallback PAT loaded from Foundry connection ({fallbackToken.Length} chars).");
 
     // GitHub identity strategy:
     //   - Preferred path (production): workflow mints a GitHub App installation
@@ -92,13 +101,14 @@ try
     //     TriageInvocationHandler pushes it onto GitHubTokenProvider's AsyncLocal.
     //     GitHubRestTools.SendAsync reads it for every outbound GitHub REST call,
     //     so the agent posts/labels as `<app>[bot]` with its own identity.
-    //   - Fallback path (CLI / local testing): the PAT from the Foundry
-    //     connection above is used. Lets us invoke without a workflow.
+    //   - Fallback path (CLI / local testing, OPTIONAL): the PAT from the
+    //     Foundry connection above. Skipped entirely if the connection isn't
+    //     configured.
     var tokenProvider = new GitHubTokenProvider(fallbackToken);
 
-    // GitHub write tools, called via REST (api.github.com) — NOT the Copilot MCP
-    // server. See GitHubRestTools.cs for the full rationale (MCP session-id
-    // staleness + the get_me/403 trap for App installation tokens).
+    // GitHub write tools, called via REST (api.github.com) directly. See
+    // GitHubRestTools.cs for the full rationale (why not the Copilot MCP
+    // server: session-id staleness + the get_me/403 trap for App tokens).
     var restTools = new GitHubRestTools(
         tokenProvider,
         Microsoft.Extensions.Logging.Abstractions.NullLogger<GitHubRestTools>.Instance);
