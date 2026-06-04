@@ -144,6 +144,24 @@ public sealed class GitHubRestTools
     /// </summary>
     public long? LastPostedCommentId => _counters.Value?.LastCommentId;
 
+    /// <summary>
+    /// Record that a comment was effectively "posted" through a path other than
+    /// <see cref="AddIssueCommentAsync"/> — specifically, the placeholder-reuse
+    /// branch in <c>StreamFollowupAsync</c> that PATCHes an existing orphan
+    /// "thinking…" comment instead of creating a new one. Without this, a
+    /// successful reuse leaves <see cref="Counters.CommentsPosted"/> at 0 and
+    /// <see cref="LastCommentId"/> null, causing the handler to (a) misclassify
+    /// the run as failed and return 502 → workflow retries → another reuse →
+    /// loop, and (b) skip the foundry-session marker append → memory loss.
+    /// </summary>
+    public void MarkCommentReused(long commentId)
+    {
+        var c = (_counters.Value ??= new Counters());
+        c.CommentsPosted++;
+        c.LastCommentId = commentId;
+        _lastCommentId.Value = commentId;
+    }
+
     private static bool IsValidTraceId(string? t) =>
         !string.IsNullOrEmpty(t) && t != "00000000000000000000000000000000";
 
