@@ -77,27 +77,36 @@ jobs:
           set -euo pipefail
           TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
 
-          # Stable per-issue base session ID — all turns on the same issue use
-          # this so the agent has full conversation memory via Foundry's thread
-          # store. Lowercased to match the handler's path-sanitizing rules.
-          # NOTE: on issue.opened RETRIES (attempt 2+) we append a "-r{N}"
-          # suffix to the session ID so Foundry routes us to a different
-          # container — escaping a container that wedged on the IMDS / MI
-          # race during a parallel cold-start (the burst failure mode where
-          # 3+ issues open simultaneously and N containers race on IMDS).
-          # For issue.opened this loses nothing: there's no prior
-          # conversation to remember, and our existing
-          # `<!-- triage-agent-reply -->` comment-marker idempotency check
-          # in the handler prevents double-triage if two attempts somehow
-          # both succeed.
-          # For issue_comment.created we ALWAYS keep the stable ID. Comment
-          # events absolutely DO hit cold-start (any comment >15 min after
-          # the last activity restores from persisted session state), but
-          # they arrive serially as humans type, so they don't trigger the
-          # parallel IMDS race that wedges containers. We've never observed
-          # a comment wedge in practice. Preserving the stable ID keeps
-          # multi-turn conversation memory intact via Foundry's session
-          # restore — that's the showcase primitive vs. App Service.
+          # Stable per-issue base session ID — first attempt on every event
+          # uses this so the agent has full conversation memory via Foundry's
+          # thread store. Lowercased to match the handler's path-sanitizing
+          # rules.
+          # NOTE: on RETRIES (attempt 2+) we always append a "-r{N}" suffix
+          # to the session ID so Foundry routes us to a different container.
+          # This escapes two failure modes we've observed:
+          #   1. issue.opened bursts: parallel cold-starts race on
+          #      MI / Workload Identity init; one container wedges; retries
+          #      with the same session_id keep hitting the wedged container
+          #      forever ("session pinning"). A fresh session_id forces
+          #      Foundry to re-route.
+          #   2. issue_comment.created after a long idle: the stable
+          #      session_id is still bound to a worker that Foundry has
+          #      already scaled away; new requests come back with HTTP 424
+          #      "session_not_ready" and never reach our container. The
+          #      retries stay pinned to that ghost binding. Again, only a
+          #      fresh session_id breaks the cycle.
+          # This is lossless for conversation memory:
+          #   - issue.opened retries have no prior turn to remember; the
+          #     `<!-- triage-agent-reply -->` comment-marker idempotency
+          #     check in the handler prevents double-triage if two attempts
+          #     somehow both succeed.
+          #   - issue_comment.created retries hydrate state from the Wave 2
+          #     `<!-- foundry-session: ... -->` marker we embed in our last
+          #     bot comment (see TriageInvocationHandler.cs — handler walks
+          #     bot comments newest-first calling
+          #     agent.DeserializeSessionAsync until one succeeds). The
+          #     Foundry session_id is only a routing key; conversation state
+          #     lives in the GitHub thread.
           BASE_SESSION_ID=$(echo "gh-${REPO_OWNER}-${REPO_NAME}-${ISSUE_NUMBER}" | tr '[:upper:]' '[:lower:]')
 
           # Map GitHub event_name -> our internal event field
@@ -168,13 +177,14 @@ jobs:
           max_attempts=5
           while : ; do
             attempt=$((attempt+1))
-            # Compute the session ID for this attempt. For issue.opened
-            # retries we uniquify with "-r{N}" so Foundry can't pin us to
-            # the same (potentially wedged) container we hit last attempt.
-            # See BASE_SESSION_ID comment above for the full rationale.
-            if [ "$EVENT" = "issue.opened" ] && [ "$attempt" -gt 1 ]; then
+            # Compute the session ID for this attempt. On retries (any event
+            # type) we uniquify with "-r{N}" so Foundry can't pin us to the
+            # same wedged / ghost-bound container we hit last attempt.
+            # See BASE_SESSION_ID comment above for the full rationale and
+            # why this is lossless for both event types.
+            if [ "$attempt" -gt 1 ]; then
               SESSION_ID="${BASE_SESSION_ID}-r${attempt}"
-              echo "Retry session ID: ${SESSION_ID} (uniquified to escape any wedged container)."
+              echo "Retry session ID: ${SESSION_ID} (uniquified to escape any wedged/stale session pin)."
             else
               SESSION_ID="${BASE_SESSION_ID}"
             fi
