@@ -544,23 +544,72 @@ public sealed class TriageInvocationHandler(
         TriagePayload payload,
         CancellationToken cancellationToken)
     {
-        // Post placeholder so the user gets immediate feedback. AddIssueCommentAsync
-        // appends the trace footer + foundry-trace marker automatically and stamps
-        // restTools.LastPostedCommentId for the Wave 2 marker append at the end.
+        // Reuse-or-create the placeholder. If a workflow curl retry fired us
+        // (e.g. a previous attempt's agent invocation hit a transient error
+        // and Foundry returned 5xx mid-stream), an earlier invocation may
+        // already have posted a "_…thinking…_" placeholder. PATCH that one
+        // instead of creating a new comment per retry — prevents the
+        // "thinking comment flood" failure mode where N curl retries × 1
+        // placeholder-per-call pollute the issue with N orphaned placeholders.
+        // We match by author=[bot] + body containing FollowupHeader + body
+        // still containing PlaceholderText (a finished stream replaces the
+        // placeholder text with the model output, so any comment still
+        // carrying PlaceholderText is by definition orphaned and safe to
+        // overwrite).
         var placeholderBody = $"{FollowupHeader}\n\n{PlaceholderText}{Cursor}\n\n{FollowupMarker}";
-        await restTools.AddIssueCommentAsync(
-            payload.Owner!, payload.Repo!, payload.IssueNumber, placeholderBody, cancellationToken);
-        var placeholderCommentId = restTools.LastPostedCommentId;
-
-        if (placeholderCommentId is null)
+        long commentId;
+        long? reusableId = null;
+        try
         {
-            // Couldn't get a comment ID back — abort streaming and let the
-            // caller treat this as a failure (the counter check below will
-            // still fail because no marker would be appended).
-            logger.LogWarning("Stream follow-up: placeholder comment ID not captured; cannot PATCH stream.");
-            return (string.Empty, null);
+            var existing = await restTools.ListIssueCommentsAsync(
+                payload.Owner!, payload.Repo!, payload.IssueNumber, maxPages: 2, cancellationToken);
+            for (var i = existing.Count - 1; i >= 0; i--)
+            {
+                var c = existing[i];
+                if (!c.Author.EndsWith("[bot]", StringComparison.Ordinal)) continue;
+                if (c.Body.Contains(FollowupHeader, StringComparison.Ordinal) &&
+                    c.Body.Contains(PlaceholderText, StringComparison.Ordinal))
+                {
+                    reusableId = c.Id;
+                    break;
+                }
+            }
         }
-        var commentId = placeholderCommentId.Value;
+        catch (Exception ex)
+        {
+            // Best-effort: if comment listing fails, fall through to creating
+            // a fresh placeholder. Worst case we get the previous behavior.
+            logger.LogWarning(ex, "Stream follow-up: listing comments for placeholder reuse failed; will create a new placeholder.");
+        }
+
+        if (reusableId is { } rid)
+        {
+            logger.LogInformation(
+                "Stream follow-up: reusing existing placeholder comment {CommentId} on issue #{Issue} (avoiding flood from retry).",
+                rid, payload.IssueNumber);
+            await restTools.ReplaceCommentBodyAsync(
+                payload.Owner!, payload.Repo!, rid, placeholderBody, cancellationToken);
+            commentId = rid;
+        }
+        else
+        {
+            // Post placeholder so the user gets immediate feedback. AddIssueCommentAsync
+            // appends the trace footer + foundry-trace marker automatically and stamps
+            // restTools.LastPostedCommentId for the Wave 2 marker append at the end.
+            await restTools.AddIssueCommentAsync(
+                payload.Owner!, payload.Repo!, payload.IssueNumber, placeholderBody, cancellationToken);
+            var newId = restTools.LastPostedCommentId;
+            if (newId is null)
+            {
+                // Couldn't get a comment ID back — abort streaming and let the
+                // caller treat this as a failure (the counter check below will
+                // still fail because no marker would be appended).
+                logger.LogWarning("Stream follow-up: placeholder comment ID not captured; cannot PATCH stream.");
+                return (string.Empty, null);
+            }
+            commentId = newId.Value;
+        }
+        var placeholderCommentId = (long?)commentId;
 
         var traceFooter = restTools.BuildTraceFooter();
         var accumulated = new StringBuilder(2048);
