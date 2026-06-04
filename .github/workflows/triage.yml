@@ -149,7 +149,7 @@ jobs:
             > /tmp/payload.json
 
           # Log shape only — never the body/comment/token, which are untrusted or secret.
-          echo "Payload: event=$EVENT session=$BASE_SESSION_ID owner=$REPO_OWNER repo=$REPO_NAME issue=$ISSUE_NUMBER titleLen=${#ISSUE_TITLE} bodyLen=${#ISSUE_BODY} commentLen=${#COMMENT_BODY} author=${COMMENT_AUTHOR:-none} ghTokenLen=${#GITHUB_APP_TOKEN}"
+          echo "Payload: event=$EVENT session=$STABLE_BASE owner=$REPO_OWNER repo=$REPO_NAME issue=$ISSUE_NUMBER titleLen=${#ISSUE_TITLE} bodyLen=${#ISSUE_BODY} commentLen=${#COMMENT_BODY} author=${COMMENT_AUTHOR:-none} ghTokenLen=${#GITHUB_APP_TOKEN}"
           if [ -n "${GITHUB_APP_TOKEN:-}" ]; then
             echo "GitHub App token present — agent will post as <app>[bot]."
           else
