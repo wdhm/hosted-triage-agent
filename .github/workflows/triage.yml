@@ -77,10 +77,28 @@ jobs:
           set -euo pipefail
           TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
 
-          # Stable per-issue session ID — all turns on the same issue use this
-          # so the agent has full conversation memory via Foundry's thread store.
-          # Lowercased to match the handler's path-sanitizing rules.
-          SESSION_ID=$(echo "gh-${REPO_OWNER}-${REPO_NAME}-${ISSUE_NUMBER}" | tr '[:upper:]' '[:lower:]')
+          # Stable per-issue base session ID — all turns on the same issue use
+          # this so the agent has full conversation memory via Foundry's thread
+          # store. Lowercased to match the handler's path-sanitizing rules.
+          # NOTE: on issue.opened RETRIES (attempt 2+) we append a "-r{N}"
+          # suffix to the session ID so Foundry routes us to a different
+          # container — escaping a container that wedged on the IMDS / MI
+          # race during a parallel cold-start (the burst failure mode where
+          # 3+ issues open simultaneously and N containers race on IMDS).
+          # For issue.opened this loses nothing: there's no prior
+          # conversation to remember, and our existing
+          # `<!-- triage-agent-reply -->` comment-marker idempotency check
+          # in the handler prevents double-triage if two attempts somehow
+          # both succeed.
+          # For issue_comment.created we ALWAYS keep the stable ID. Comment
+          # events absolutely DO hit cold-start (any comment >15 min after
+          # the last activity restores from persisted session state), but
+          # they arrive serially as humans type, so they don't trigger the
+          # parallel IMDS race that wedges containers. We've never observed
+          # a comment wedge in practice. Preserving the stable ID keeps
+          # multi-turn conversation memory intact via Foundry's session
+          # restore — that's the showcase primitive vs. App Service.
+          BASE_SESSION_ID=$(echo "gh-${REPO_OWNER}-${REPO_NAME}-${ISSUE_NUMBER}" | tr '[:upper:]' '[:lower:]')
 
           # Map GitHub event_name -> our internal event field
           if [ "$EVENT_NAME" = "issues" ]; then
@@ -113,7 +131,7 @@ jobs:
             > /tmp/payload.json
 
           # Log shape only — never the body/comment/token, which are untrusted or secret.
-          echo "Payload: event=$EVENT session=$SESSION_ID owner=$REPO_OWNER repo=$REPO_NAME issue=$ISSUE_NUMBER titleLen=${#ISSUE_TITLE} bodyLen=${#ISSUE_BODY} commentLen=${#COMMENT_BODY} author=${COMMENT_AUTHOR:-none} ghTokenLen=${#GITHUB_APP_TOKEN}"
+          echo "Payload: event=$EVENT session=$BASE_SESSION_ID owner=$REPO_OWNER repo=$REPO_NAME issue=$ISSUE_NUMBER titleLen=${#ISSUE_TITLE} bodyLen=${#ISSUE_BODY} commentLen=${#COMMENT_BODY} author=${COMMENT_AUTHOR:-none} ghTokenLen=${#GITHUB_APP_TOKEN}"
           if [ -n "${GITHUB_APP_TOKEN:-}" ]; then
             echo "GitHub App token present — agent will post as <app>[bot]."
           else
@@ -150,6 +168,16 @@ jobs:
           max_attempts=5
           while : ; do
             attempt=$((attempt+1))
+            # Compute the session ID for this attempt. For issue.opened
+            # retries we uniquify with "-r{N}" so Foundry can't pin us to
+            # the same (potentially wedged) container we hit last attempt.
+            # See BASE_SESSION_ID comment above for the full rationale.
+            if [ "$EVENT" = "issue.opened" ] && [ "$attempt" -gt 1 ]; then
+              SESSION_ID="${BASE_SESSION_ID}-r${attempt}"
+              echo "Retry session ID: ${SESSION_ID} (uniquified to escape any wedged container)."
+            else
+              SESSION_ID="${BASE_SESSION_ID}"
+            fi
             # Run curl in a way that does NOT trip `set -e` on failure: temporarily
             # disable -e around the call and capture both HTTP_CODE and curl's exit
             # status. Important because curl exit 28 (timeout) — which we WANT to
