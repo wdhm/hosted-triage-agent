@@ -589,6 +589,15 @@ public sealed class TriageInvocationHandler(
                 rid, payload.IssueNumber);
             await restTools.ReplaceCommentBodyAsync(
                 payload.Owner!, payload.Repo!, rid, placeholderBody, cancellationToken);
+            // CRITICAL: bump CommentsPosted + set LastCommentId on the counters
+            // even though we didn't POST. The handler downstream uses these to
+            // (1) decide whether the invocation succeeded (CommentsPosted==0 →
+            // 502 → workflow retries → more reuse → infinite loop), and
+            // (2) PATCH the foundry-session marker onto the comment we just
+            // streamed into (without LastCommentId the marker append is skipped
+            // and the next turn loses session memory). See MarkCommentReused
+            // for the full rationale.
+            restTools.MarkCommentReused(rid);
             commentId = rid;
         }
         else

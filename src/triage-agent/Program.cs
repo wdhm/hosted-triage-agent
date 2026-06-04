@@ -19,6 +19,14 @@ foreach (var name in new[]
     "GITHUB_PAT_CONNECTION_NAME",
     "APPLICATIONINSIGHTS_CONNECTION_STRING",
     "HOME",
+    // Identity-related — used to choose the correct Azure.Identity credential
+    // path below. Logged at startup so we can verify, post-deploy, that we're
+    // on the WorkloadIdentity path Foundry Hosted Agents expect and not
+    // silently falling back to IMDS.
+    "AZURE_CLIENT_ID",
+    "AZURE_TENANT_ID",
+    "AZURE_FEDERATED_TOKEN_FILE",
+    "AZURE_TOKEN_CREDENTIALS",
 })
 {
     var v = Environment.GetEnvironmentVariable(name);
@@ -51,51 +59,74 @@ try
     Console.WriteLine($"[startup] Using model deployment: {modelDeployment}");
     Console.WriteLine($"[startup] PAT fallback connection (optional): {patConnectionName}");
 
-    // Use ManagedIdentityCredential directly when AZURE_CLIENT_ID is set
-    // (Foundry hosted runtime injects it). DefaultAzureCredential probes
-    // through Environment → WorkloadIdentity → MI → AzureCli → … in series,
-    // each with its own IMDS round-trip — that probe chain burns 10-30s on
-    // a cold start and demonstrably widens the IMDS race we observed under
-    // burst load (3+ simultaneous cold-starts, 3 of 5 issues failed in the
-    // burst test on v34 with ManagedIdentityCredential MI exceptions filling
-    // the App Insights exceptions table for those issues' 7-min retry budget).
-    // Targeting the credential directly cuts startup auth from ~15s to ~2s.
-    // Falls back to DefaultAzureCredential when AZURE_CLIENT_ID is unset
-    // (i.e., local `dotnet run` against an az login session).
-    var azureClientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
+    // Credential selection.
+    //
+    // Foundry Hosted Agents authenticate via **Workload Identity Federation**
+    // (the AKS pattern): the runtime injects AZURE_TENANT_ID + AZURE_CLIENT_ID +
+    // AZURE_FEDERATED_TOKEN_FILE, and Azure.Identity's WorkloadIdentityCredential
+    // reads the projected token file and exchanges it with Entra ID directly —
+    // no IMDS round-trip required. This is what the official sample
+    // (microsoft-foundry/foundry-samples/.../hello-world/Program.cs) relies on
+    // when it does `new AIProjectClient(endpoint, new DefaultAzureCredential())`.
+    //
+    // PR #67 in this repo previously did `new ManagedIdentityCredential(AZURE_CLIENT_ID)`
+    // because we treated AZURE_CLIENT_ID as a signal to use IMDS-only MI. That
+    // was wrong: in Workload Identity environments AZURE_CLIENT_ID is set for
+    // the WorkloadIdentityCredential constructor, NOT to flag MI. Forcing the
+    // IMDS path meant every cold-start request lived or died by whether IMDS
+    // happened to be reachable from the Foundry container at that moment, which
+    // produced the wall of "ManagedIdentityCredential authentication failed:
+    // No response received from the managed identity endpoint" errors we saw.
+    //
+    // Strategy now (matches the official sample, with one production hardening):
+    //   - In Foundry (detected by AZURE_FEDERATED_TOKEN_FILE being set):
+    //     DefaultAzureCredential with ExcludeManagedIdentityCredential=true.
+    //     This locks the chain to Environment → WorkloadIdentity → (developer
+    //     creds, which never resolve in-container). No silent fallback to IMDS,
+    //     so if Foundry's federated token wiring ever breaks we fail loud
+    //     instead of accidentally trying a path that doesn't apply.
+    //   - Outside Foundry (no federated token file, e.g. local `dotnet run`
+    //     against `az login`): plain DefaultAzureCredential — full chain
+    //     including AzureCliCredential / VisualStudioCredential / etc.
+    var federatedTokenFile = Environment.GetEnvironmentVariable("AZURE_FEDERATED_TOKEN_FILE");
+    var inFoundryWorkloadIdentity = !string.IsNullOrWhiteSpace(federatedTokenFile);
     Azure.Core.TokenCredential credential;
-    if (!string.IsNullOrWhiteSpace(azureClientId))
+    if (inFoundryWorkloadIdentity)
     {
-        Console.WriteLine($"[startup] Using ManagedIdentityCredential (clientId={azureClientId[..Math.Min(8, azureClientId.Length)]}…).");
-        credential = new Azure.Identity.ManagedIdentityCredential(azureClientId);
+        Console.WriteLine(
+            $"[startup] Workload Identity detected (AZURE_FEDERATED_TOKEN_FILE set). " +
+            $"Using DefaultAzureCredential with ManagedIdentityCredential excluded — " +
+            $"forces the WorkloadIdentityCredential path, no IMDS fallback.");
+        credential = new Azure.Identity.DefaultAzureCredential(
+            new Azure.Identity.DefaultAzureCredentialOptions
+            {
+                ExcludeManagedIdentityCredential = true,
+            });
     }
     else
     {
-        Console.WriteLine("[startup] AZURE_CLIENT_ID not set — falling back to DefaultAzureCredential (local-dev path).");
+        Console.WriteLine(
+            "[startup] No AZURE_FEDERATED_TOKEN_FILE — using full DefaultAzureCredential " +
+            "chain (local dev: az login / VS / etc.).");
         credential = new Azure.Identity.DefaultAzureCredential();
     }
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
 
-    // Block startup until the credential actually works. Foundry's IMDS
-    // endpoint is occasionally not ready when the container starts processing
-    // requests — observed empirically as a wave of
-    // "ManagedIdentityCredential authentication failed: No response received
-    // from the managed identity endpoint" exceptions filling App Insights,
-    // with Foundry returning 502 to every retry. The workflow's curl retry
-    // loop then keeps re-firing the agent, which (because the placeholder is
-    // posted before the LLM call) floods the issue with thinking comments.
-    //
-    // Fix: try to acquire a token now. Retry with exponential backoff for
-    // ~67s. If MI still fails after that, throw — the .NET process exits,
-    // Foundry restarts the container, and the next boot gets a fresh shot
-    // at a working IMDS. By the time we reach `app.Run()` below, MI is known
-    // good for the lifetime of this container (the SDK caches tokens).
+    // Block startup until the credential actually works. With Workload Identity
+    // the token exchange is usually instant (read a file, POST it to Entra),
+    // but if the federated token file is missing, unreadable, or stale, or if
+    // the trust between the agent identity and the project MI has drifted,
+    // we'd rather fail loud right here than serve 502s. The retry budget covers
+    // the rare case where the projected token volume isn't fully mounted yet
+    // at process start. On final failure we throw, the .NET process exits,
+    // and Foundry restarts the container on a clean slate.
     WarmUpCredential(credential);
 
     static void WarmUpCredential(Azure.Core.TokenCredential credential)
     {
         // Cognitive Services scope — covers all Foundry / Azure OpenAI calls
-        // the agent makes downstream. Any working scope proves IMDS is alive.
+        // the agent makes downstream. Any working scope proves the credential
+        // chain can issue tokens for the resources we actually call.
         var ctx = new Azure.Core.TokenRequestContext(new[] { "https://cognitiveservices.azure.com/.default" });
         var backoffs = new[] { 2, 5, 10, 20, 30 }; // 5 retries, ~67s budget
         Exception? lastError = null;
@@ -128,10 +159,9 @@ try
         }
         Console.WriteLine(
             $"[startup] Credential warm-up FAILED after {backoffs.Length + 1} attempts " +
-            $"({totalSw.ElapsedMilliseconds}ms total). Exiting so Foundry restarts the container " +
-            $"with a fresh IMDS.");
+            $"({totalSw.ElapsedMilliseconds}ms total). Exiting so Foundry restarts the container.");
         throw new InvalidOperationException(
-            "Managed identity warm-up failed; refusing to start agent to avoid serving 502s.",
+            "Credential warm-up failed; refusing to start agent to avoid serving 502s.",
             lastError);
     }
 
