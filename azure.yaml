@@ -20,3 +20,56 @@ services:
 infra:
     provider: bicep
     path: ./infra
+hooks:
+    postdeploy:
+        windows:
+            name: postdeploy
+            kind: pwsh
+            shell: pwsh
+            run: |
+                if ($env:AZD_SKIP_REHEARSE -eq "1") {
+                    Write-Host "AZD_SKIP_REHEARSE=1 — skipping post-deploy rehearse probe."
+                    exit 0
+                }
+                Write-Host "Triggering agent-rehearse workflow to validate the new deploy…"
+                gh workflow run agent-rehearse.yml --ref main
+                if ($LASTEXITCODE -ne 0) { throw "gh workflow run failed (exit $LASTEXITCODE). Is gh authed?" }
+                # Give GitHub a moment to register the run before we ask for its ID.
+                Start-Sleep -Seconds 5
+                $runs = gh run list --workflow agent-rehearse.yml --limit 1 --json databaseId,status | ConvertFrom-Json
+                if (-not $runs -or $runs.Count -eq 0) { throw "Could not find the rehearse run we just triggered." }
+                $runId = $runs[0].databaseId
+                Write-Host "Watching rehearse run $runId…"
+                gh run watch $runId --exit-status
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Error "Post-deploy rehearse FAILED. The agent registered but is not responding to a ping. Investigate before treating this deploy as live."
+                    exit 1
+                }
+                Write-Host "✓ Post-deploy rehearse passed — agent is reachable."
+            interactive: true
+        posix:
+            shell: sh
+            run: |
+                if [ "${AZD_SKIP_REHEARSE:-0}" = "1" ]; then
+                    echo "AZD_SKIP_REHEARSE=1 — skipping post-deploy rehearse probe."
+                    exit 0
+                fi
+                echo "Triggering agent-rehearse workflow to validate the new deploy…"
+                gh workflow run agent-rehearse.yml --ref main
+                # Give GitHub a moment to register the run before we ask for its ID.
+                sleep 5
+                RUN_ID=$(gh run list --workflow agent-rehearse.yml --limit 1 --json databaseId -q '.[0].databaseId')
+                if [ -z "$RUN_ID" ]; then
+                    echo "Could not find the rehearse run we just triggered." >&2
+                    exit 1
+                fi
+                echo "Watching rehearse run $RUN_ID…"
+                gh run watch "$RUN_ID" --exit-status
+                # gh run watch already exits non-zero on failure; this trap is belt-and-braces.
+                STATUS=$?
+                if [ "$STATUS" -ne 0 ]; then
+                    echo "Post-deploy rehearse FAILED. The agent registered but is not responding to a ping. Investigate before treating this deploy as live." >&2
+                    exit 1
+                fi
+                echo "✓ Post-deploy rehearse passed — agent is reachable."
+            interactive: true
