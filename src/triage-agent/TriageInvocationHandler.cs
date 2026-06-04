@@ -168,6 +168,28 @@ public sealed class TriageInvocationHandler(
             return;
         }
 
+        // ── "ping" liveness probe ──────────────────────────────────────────
+        // A side-effect-free probe used by the agent-rehearse workflow to
+        // verify the container is alive + Foundry routing works WITHOUT
+        // touching GitHub, calling the LLM, or mutating any state. Returns
+        // immediately with HTTP 200 "OK: pong". Skips all downstream
+        // validation (owner/repo/issue_number) because a probe has no target.
+        // If you ever see a rehearse fail with anything other than this 200
+        // response, the agent runtime — not the agent code — is the problem.
+        if (payload is not null
+            && string.Equals(payload.Event, "ping", StringComparison.OrdinalIgnoreCase))
+        {
+            logger.LogInformation(
+                "Ping received: invocationId={InvocationId} sessionId={SessionId}",
+                context.InvocationId, sessionId);
+            response.StatusCode = StatusCodes.Status200OK;
+            response.ContentType = "text/plain; charset=utf-8";
+            await response.WriteAsync(
+                $"OK: pong invocationId={context.InvocationId} sessionId={sessionId}",
+                cancellationToken);
+            return;
+        }
+
         if (payload is null
             || string.IsNullOrWhiteSpace(payload.Owner)
             || string.IsNullOrWhiteSpace(payload.Repo)
