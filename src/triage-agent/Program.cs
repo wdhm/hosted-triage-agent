@@ -48,24 +48,51 @@ try
     Console.WriteLine($"[startup] Using project endpoint: {projectEndpoint}");
     Console.WriteLine($"[startup] Using model deployment: {modelDeployment}");
 
-    // Credential: plain DefaultAzureCredential, matching the official Foundry
-    // hosted-agents samples
-    // (microsoft-foundry/foundry-samples/samples/csharp/hosted-agents/agent-framework/*).
+    // Credential — explicit user-assigned ManagedIdentityCredential when the
+    // Foundry runtime injects AZURE_CLIENT_ID; plain DefaultAzureCredential
+    // otherwise (local dev with `az login`).
     //
-    // The Foundry runtime injects AZURE_CLIENT_ID + AZURE_TENANT_ID pointing at
-    // the agent identity (an Entra service principal that azd auto-creates and
-    // grants the `Foundry User` role at project scope — verified via
-    // `az role assignment list --assignee $AZURE_CLIENT_ID --all`). DAC reads
-    // those env vars and authenticates through ManagedIdentityCredential with
-    // the right client_id; no manual wiring needed. Outside Foundry (local
-    // `dotnet run`) DAC falls back to AzureCliCredential / VisualStudio etc.
+    // Why NOT plain `new DefaultAzureCredential()` (as the official samples
+    // show in the foundry-samples repo)? Because DAC's *internal*
+    // ManagedIdentityCredential sub-credential does **not** auto-read
+    // AZURE_CLIENT_ID. `DefaultAzureCredentialOptions.ManagedIdentityClientId`
+    // defaults to null, and DAC passes that through to MIC's ctor, so MIC
+    // calls IMDS asking for the *system-assigned* MI — which Foundry
+    // containers don't have. Every probe times out after ~22-30s of MSAL
+    // backoff, costing ~3 minutes across the Foundry gateway's internal
+    // retry budget per invocation.
     //
-    // We previously had a `new WorkloadIdentityCredential()` branch gated on
-    // AZURE_FEDERATED_TOKEN_FILE plus an in-process AZURE_TOKEN_CREDENTIALS
-    // env-var lock — that was cargo-culted from an AKS-style WIF setup that
-    // Foundry does NOT use. Confirmed by App Insights traces showing zero WIF
-    // activity and a working user-assigned MI cache entry for our AZURE_CLIENT_ID.
-    var credential = new DefaultAzureCredential();
+    // Verified live (v40, App Insights MSAL traces during issue #87):
+    //   partition `22839df0-..._managed_identity_AppTokenCache`             178 successful hits  ← App Insights export (passes client_id explicitly)
+    //   partition `system_assigned_managed_identity_managed_identity_...`    12 failed hits      ← our DAC chain
+    //
+    // The samples appear to work because they use the Responses protocol
+    // (`AddFoundryResponses`), where Foundry's gateway mediates the OpenAI
+    // call and the in-container credential is never asked for a model
+    // token. Our Invocations protocol path constructs the AIProjectClient +
+    // OpenAI chat client in-process, so the LLM call hits BearerTokenPolicy
+    // → our credential → MIC. With no client_id, IMDS returns 500 every
+    // single time.
+    //
+    // Fix: pin MIC to the agent identity that azd auto-created and granted
+    // `Foundry User` at project scope. AZURE_CLIENT_ID is the discovery
+    // mechanism Foundry uses to tell us which identity to authenticate as.
+    var azureClientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
+    Azure.Core.TokenCredential credential;
+    if (!string.IsNullOrWhiteSpace(azureClientId))
+    {
+        Console.WriteLine(
+            $"[startup] Using ManagedIdentityCredential pinned to AZURE_CLIENT_ID " +
+            $"({azureClientId[..8]}...) — Foundry's per-agent Entra identity.");
+        credential = new ManagedIdentityCredential(
+            ManagedIdentityId.FromUserAssignedClientId(azureClientId));
+    }
+    else
+    {
+        Console.WriteLine(
+            "[startup] No AZURE_CLIENT_ID — using DefaultAzureCredential (local dev).");
+        credential = new DefaultAzureCredential();
+    }
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
 
     // NOTE: we deliberately do NOT perform any blocking I/O between here and
