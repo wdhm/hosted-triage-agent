@@ -140,18 +140,33 @@ jobs:
           max_attempts=4
           while : ; do
             attempt=$((attempt+1))
+            # Run curl in a way that does NOT trip `set -e` on failure: temporarily
+            # disable -e around the call and capture both HTTP_CODE and curl's exit
+            # status. Important because curl exit 28 (timeout) — which we WANT to
+            # retry — would otherwise kill the script before the case below runs.
+            # --max-time 90 caps a single attempt; Foundry warm responses are <30s.
+            set +e
             HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
               -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/json" \
               -H "Foundry-Features: HostedAgents=V1Preview" \
               --data-binary @/tmp/payload.json \
-              --max-time 120 \
+              --max-time 90 \
               -o /tmp/reply.txt \
               -w '%{http_code}')
-            echo "Attempt ${attempt}/${max_attempts}: HTTP ${HTTP_CODE}"
+            CURL_EXIT=$?
+            set -e
+            # Treat curl-level failures (timeout=28, conn-refused=7, etc.) as a
+            # synthetic "000" status so the retry case-statement handles them.
+            if [ "$CURL_EXIT" -ne 0 ]; then
+              echo "Attempt ${attempt}/${max_attempts}: curl exit=${CURL_EXIT} (HTTP=${HTTP_CODE:-none}) — treating as transient."
+              HTTP_CODE="000"
+            else
+              echo "Attempt ${attempt}/${max_attempts}: HTTP ${HTTP_CODE}"
+            fi
             case "$HTTP_CODE" in
               200) break ;;
-              408|424|425|429|5??)
+              000|408|424|425|429|5??)
                 if [ "$attempt" -ge "$max_attempts" ]; then
                   echo "::warning::Giving up after ${attempt} attempts (last HTTP ${HTTP_CODE})."
                   break
