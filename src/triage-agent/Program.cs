@@ -95,6 +95,17 @@ try
     }
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
 
+    // Kick off background credential pre-warm. Foundry's per-container MI
+    // takes several minutes to provision in the IMDS sidecar after first
+    // boot (observed ~6 min for v41 in App Insights), during which IMDS
+    // returns HTTP 500. Without pre-warm, every single /invocations triggers
+    // its own ~30-50s IMDS retry storm. With pre-warm, the storm happens
+    // exactly once per container, in the background, and the handler just
+    // awaits the cached token. See TokenWarmup.cs for the full rationale.
+    var tokenWarmup = new TokenWarmup(credential);
+    tokenWarmup.Start();
+    builder.Services.AddSingleton(tokenWarmup);
+
     // NOTE: we deliberately do NOT perform any blocking I/O between here and
     // `app.Run()` below. Earlier revisions did a `WarmUpCredential` token
     // exchange (up to ~67s of retries) and a synchronous PAT-connection

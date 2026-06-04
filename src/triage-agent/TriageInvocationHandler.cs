@@ -24,6 +24,7 @@ public sealed class TriageInvocationHandler(
     AgentBundle agents,
     GitHubTokenProvider tokenProvider,
     GitHubRestTools restTools,
+    TokenWarmup tokenWarmup,
     ILogger<TriageInvocationHandler> logger) : InvocationHandler
 {
     public const string TriageSystemInstruction = """
@@ -203,6 +204,18 @@ public sealed class TriageInvocationHandler(
         }
 
         var eventType = payload.Event ?? "issue.opened"; // default for backward compat with direct invocation
+
+        // Block on the credential pre-warm BEFORE any token-bearing work.
+        // On a freshly-provisioned Foundry container this can take 5-10 min
+        // (Azure MI provisioning delay — IMDS returns 500 until the per-
+        // container identity is federated). Without this gate, every
+        // invocation would trigger its own ~30-50s IMDS retry storm and
+        // chew through Foundry's gateway retry budget for nothing. The
+        // pre-warm task started at container boot does the storm once;
+        // we just await its completion here. Cap at 8 min so a stuck
+        // warm-up never wedges a request indefinitely — if we time out
+        // we fall through and let the credential itself try.
+        await tokenWarmup.ReadyAsync(TimeSpan.FromMinutes(8), cancellationToken);
 
         // Pull the per-request GitHub App installation token (minted by the
         // workflow) from the JSON body. We deliberately do NOT use a custom
