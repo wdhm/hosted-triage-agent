@@ -174,11 +174,20 @@ line in a customer conversation):
    conversation.
 
 5. **Burst cold-start (`HTTP 424 session_not_ready`).** Foundry returns 424
-   while it spins up an instance for a brand-new session; under a burst of
-   N parallel issues this can hit several callers at once. The workflow's
-   `curl` is wrapped in a bash retry loop with exponential backoff
-   (`8s → 16s → 32s`, max 4 attempts). `curl --retry` alone doesn't work
-   here — it treats 4xx as "server replied successfully" and doesn't fire.
+   while it spins up an instance for a brand-new session, and (sticky) while
+   a `session_id` is bound to a container that's been scaled away mid-idle.
+   The workflow's `curl` is wrapped in a bash retry loop with exponential
+   backoff (`8s → 16s → 32s → 64s`, max 5 attempts). `curl --retry` alone
+   doesn't fire here — it treats 4xx as "server replied successfully".
+   Retries uniquify the `agent_session_id` (`-r{N}` suffix on comments,
+   per-attempt random id on new issues) so a wedged session can't pin every
+   retry to the same dead container. Conversation memory is unaffected
+   because it lives in Foundry's `ConversationId` (round-tripped via the
+   `<!-- foundry-session: ... -->` marker on the bot comment), not in the
+   `session_id`. Note: the invocation gateway throttles sustained bursts
+   above ~6 sequential calls per warm period with a sticky 5xx that takes
+   5–10 minutes to recover, so very large issue bursts should expect the
+   tail end to queue at the retry budget's outer edge.
 
 6. **Streaming without losing tracing.** The follow-up path uses
    `RunStreamingAsync` and throttle-PATCHes the comment body every 500ms or
@@ -186,6 +195,24 @@ line in a customer conversation):
    there's no double-post risk. App Insights still sees one
    `invoke_agent` span per request, plus one `gen_ai.chat` span and N
    `replace_comment_body` spans — the trace tree is unchanged.
+
+7. **Zero blocking I/O before `app.Run()`.** A previous revision did a
+   credential warm-up and a PAT-connection lookup synchronously between
+   `AgentHost.CreateBuilder()` and `app.Run()`. With Kestrel not yet
+   listening during those calls, Foundry's `/readiness` probes saw
+   connection-refused and the gateway manufactured the very `424
+   session_not_ready` responses the warm-up was meant to prevent. Auth is
+   now lazy — the first real request triggers the Workload Identity token
+   exchange (a file read + Entra POST, typically &lt;200 ms); transient
+   failures are absorbed by the workflow's retry loop. There is no longer
+   a static PAT path in the agent.
+
+8. **Container logstream on failure.** When the workflow exhausts its
+   retry budget, the next step calls Foundry's `:logstream` endpoint for
+   the failing `session_id` and uploads the stream as a workflow artifact
+   (`foundry-logstream-<run>-<attempt>`). This collapses the failure-mode
+   investigation loop from "spelunk App Insights for spans that may never
+   have been emitted" to "open the artifact, read the container stdout".
 
 ## App Insights tracing
 

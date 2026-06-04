@@ -77,37 +77,46 @@ jobs:
           set -euo pipefail
           TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
 
-          # Stable per-issue base session ID — first attempt on every event
-          # uses this so the agent has full conversation memory via Foundry's
-          # thread store. Lowercased to match the handler's path-sanitizing
-          # rules.
-          # NOTE: on RETRIES (attempt 2+) we always append a "-r{N}" suffix
-          # to the session ID so Foundry routes us to a different container.
-          # This escapes two failure modes we've observed:
-          #   1. issue.opened bursts: parallel cold-starts race on
-          #      MI / Workload Identity init; one container wedges; retries
-          #      with the same session_id keep hitting the wedged container
-          #      forever ("session pinning"). A fresh session_id forces
-          #      Foundry to re-route.
+          # Per-attempt Foundry agent_session_id.
+          #
+          # Foundry's agent_session_id is a routing key: it pins a request to
+          # a specific per-session VM. It is NOT where conversation memory
+          # lives — that's the AgentSession.ConversationId we round-trip via
+          # the `<!-- foundry-session: ... -->` marker on our bot comment.
+          # (Confirmed against the platform docs and the agent-framework
+          # source; see PR #76 / the "Why we rotate session_id" notes in
+          # README.md section 5.)
+          #
+          # We've observed two distinct ways the platform binds a session_id
+          # to a doomed container:
+          #
+          #   1. issue.opened bursts: parallel cold-starts race on auth init.
+          #      One container wedges; retries pinned to the same
+          #      session_id keep hitting the same wedged container forever.
+          #
           #   2. issue_comment.created after a long idle: the stable
-          #      session_id is still bound to a worker that Foundry has
-          #      already scaled away; new requests come back with HTTP 424
-          #      "session_not_ready" and never reach our container. The
-          #      retries stay pinned to that ghost binding. Again, only a
-          #      fresh session_id breaks the cycle.
-          # This is lossless for conversation memory:
-          #   - issue.opened retries have no prior turn to remember; the
-          #     `<!-- triage-agent-reply -->` comment-marker idempotency
-          #     check in the handler prevents double-triage if two attempts
-          #     somehow both succeed.
-          #   - issue_comment.created retries hydrate state from the Wave 2
-          #     `<!-- foundry-session: ... -->` marker we embed in our last
-          #     bot comment (see TriageInvocationHandler.cs — handler walks
-          #     bot comments newest-first calling
-          #     agent.DeserializeSessionAsync until one succeeds). The
-          #     Foundry session_id is only a routing key; conversation state
-          #     lives in the GitHub thread.
-          BASE_SESSION_ID=$(echo "gh-${REPO_OWNER}-${REPO_NAME}-${ISSUE_NUMBER}" | tr '[:upper:]' '[:lower:]')
+          #      session_id is still bound to a worker Foundry has already
+          #      scaled away; the gateway returns HTTP 424
+          #      "session_not_ready" and never forwards to a fresh
+          #      container.
+          #
+          # Strategy:
+          #
+          #   - issue.opened uses a fresh, run-and-attempt-scoped session_id
+          #     every single time. There is no first-turn memory to
+          #     preserve, so the warm-path benefit of a stable id is zero.
+          #     Burning a per-event session avoids inheriting any wedge from
+          #     a prior run.
+          #
+          #   - issue_comment.created keeps a stable per-issue session_id on
+          #     attempt 1 (so a quick follow-up comment lands on the warm
+          #     container that just served the previous turn — fastest
+          #     path). On attempt 2+ we uniquify with "-r{N}" to force
+          #     Foundry to re-route to a fresh container. The handler
+          #     hydrates conversation state from the comment marker
+          #     regardless of which container picks up the call, so
+          #     rotation is lossless.
+          STABLE_BASE=$(echo "gh-${REPO_OWNER}-${REPO_NAME}-${ISSUE_NUMBER}" | tr '[:upper:]' '[:lower:]')
 
           # Map GitHub event_name -> our internal event field
           if [ "$EVENT_NAME" = "issues" ]; then
@@ -144,7 +153,8 @@ jobs:
           if [ -n "${GITHUB_APP_TOKEN:-}" ]; then
             echo "GitHub App token present — agent will post as <app>[bot]."
           else
-            echo "No GitHub App token — agent will use PAT fallback."
+            echo "::error::No GitHub App token present — the agent cannot post comments. Check TRIAGE_AGENT_APP_ID / TRIAGE_AGENT_APP_PRIVATE_KEY repo secrets."
+            exit 1
           fi
 
           # The agent posts the comment (and labels, for issue.opened) by
@@ -177,16 +187,22 @@ jobs:
           max_attempts=5
           while : ; do
             attempt=$((attempt+1))
-            # Compute the session ID for this attempt. On retries (any event
-            # type) we uniquify with "-r{N}" so Foundry can't pin us to the
-            # same wedged / ghost-bound container we hit last attempt.
-            # See BASE_SESSION_ID comment above for the full rationale and
-            # why this is lossless for both event types.
-            if [ "$attempt" -gt 1 ]; then
-              SESSION_ID="${BASE_SESSION_ID}-r${attempt}"
-              echo "Retry session ID: ${SESSION_ID} (uniquified to escape any wedged/stale session pin)."
+            # Compute session_id for this attempt (see STABLE_BASE block
+            # above for the full rationale).
+            #   - issue.opened: fresh per-attempt id, no warm-path inheritance.
+            #   - issue_comment.created attempt 1: stable per-issue id (warm
+            #     path benefit when follow-ups arrive on a still-hot
+            #     container).
+            #   - issue_comment.created attempt 2+: stable id with "-r{N}"
+            #     suffix to break out of any session->wedged-container pin.
+            if [ "$EVENT" = "issue.opened" ]; then
+              SESSION_ID="${STABLE_BASE}-run${GITHUB_RUN_ID}-a${attempt}"
+              echo "issue.opened session ID: ${SESSION_ID} (fresh per-attempt — no first-turn memory to preserve)."
+            elif [ "$attempt" -gt 1 ]; then
+              SESSION_ID="${STABLE_BASE}-r${attempt}"
+              echo "Comment retry session ID: ${SESSION_ID} (uniquified to escape any wedged/stale session pin)."
             else
-              SESSION_ID="${BASE_SESSION_ID}"
+              SESSION_ID="${STABLE_BASE}"
             fi
             # Run curl in a way that does NOT trip `set -e` on failure: temporarily
             # disable -e around the call and capture both HTTP_CODE and curl's exit
@@ -232,7 +248,76 @@ jobs:
           echo "Agent response body:"
           cat /tmp/reply.txt
           echo
+
+          # Preserve the session_id of the LAST attempt so the diagnostic
+          # step below can pull container stdout for that exact session.
+          echo "${SESSION_ID}" > /tmp/last-session-id.txt
+
           if [ "$HTTP_CODE" != "200" ]; then
             echo "::error::Foundry returned HTTP $HTTP_CODE"
             exit 1
           fi
+
+      - name: Capture Foundry container logstream (on failure)
+        # Best-effort: when the invoke step fails (typically with a sticky
+        # 424 or 5xx after all retries are exhausted), call Foundry's
+        # undocumented `:logstream` endpoint to pull the container's stdout
+        # for the failing session and upload it as a workflow artifact. This
+        # gives us a one-step path from "workflow failed" to "exactly which
+        # line in Program.cs blew up", instead of having to spelunk App
+        # Insights traces for a session that may never have produced any
+        # because it died pre-readiness.
+        #
+        # We don't fail the workflow on this step — `continue-on-error: true`
+        # plus best-effort `set +e` inside the script. The artifact upload
+        # step below will publish whatever we managed to capture.
+        if: failure()
+        continue-on-error: true
+        env:
+          INVOCATIONS_URL: ${{ vars.FOUNDRY_INVOCATIONS_URL }}
+        run: |
+          set +e
+          mkdir -p /tmp/foundry-logs
+          touch /tmp/foundry-logs/logstream.txt
+          SID=$(cat /tmp/last-session-id.txt 2>/dev/null || echo "")
+          if [ -z "$SID" ]; then
+            echo "No last session id captured — skipping logstream."
+            echo "No session id captured." > /tmp/foundry-logs/logstream.txt
+            exit 0
+          fi
+          # Derive the logstream URL from INVOCATIONS_URL. The invocations
+          # endpoint is shaped:
+          #   https://<project>.../agents/<name>/versions/<ver>/invocations?api-version=v1
+          # The control-plane logstream endpoint is:
+          #   https://<project>.../agents/<name>/versions/<ver>/sessions/<sid>:logstream?api-version=2025-11-15-preview
+          BASE_URL="${INVOCATIONS_URL%%\?*}"      # strip query string
+          BASE_URL="${BASE_URL%/invocations}"     # strip /invocations suffix
+          LOG_URL="${BASE_URL}/sessions/${SID}:logstream?api-version=2025-11-15-preview"
+          echo "Logstream URL: ${LOG_URL}"
+          # Re-mint a token (the original one was scoped in the previous step).
+          TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv 2>/dev/null)
+          if [ -z "$TOKEN" ]; then
+            echo "Could not mint Azure token — skipping logstream."
+            echo "No Azure token available." > /tmp/foundry-logs/logstream.txt
+            exit 0
+          fi
+          # SSE stream; cap at 30s and 1MB so this step can't hang the workflow.
+          curl -sS --max-time 30 --max-filesize 1048576 \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: text/event-stream" \
+            "${LOG_URL}" \
+            -o /tmp/foundry-logs/logstream.txt
+          echo "Captured $(wc -c < /tmp/foundry-logs/logstream.txt) bytes of logstream."
+          echo "--- first 4KB of logstream ---"
+          head -c 4096 /tmp/foundry-logs/logstream.txt || true
+          echo
+          echo "--- end ---"
+
+      - name: Upload Foundry logstream artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundry-logstream-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/foundry-logs/
+          if-no-files-found: ignore
+          retention-days: 14

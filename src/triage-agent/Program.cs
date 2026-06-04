@@ -16,7 +16,6 @@ foreach (var name in new[]
     "AZURE_AI_PROJECT_ENDPOINT",
     "FOUNDRY_PROJECT_ENDPOINT",
     "TRIAGE_MODEL_DEPLOYMENT",
-    "GITHUB_PAT_CONNECTION_NAME",
     "APPLICATIONINSIGHTS_CONNECTION_STRING",
     "HOME",
     // Identity-related — used to choose the correct Azure.Identity credential
@@ -44,20 +43,9 @@ try
             "Neither AZURE_AI_PROJECT_ENDPOINT nor FOUNDRY_PROJECT_ENDPOINT is set.");
     var modelDeployment = Environment.GetEnvironmentVariable("TRIAGE_MODEL_DEPLOYMENT")
         ?? "gpt-5-mini";
-    // Foundry connection holding a fallback PAT (key="Authorization",
-    // value="Bearer <pat>"). Used only when no per-request App token is
-    // present (e.g. direct CLI invocation without the workflow). Production
-    // runs through the workflow which mints a fresh GitHub App installation
-    // token per call, so this connection is OPTIONAL — if absent, startup
-    // succeeds with a null fallback and direct CLI invocations will simply
-    // fail with "no GitHub token in scope" instead of a startup crash.
-    var patConnectionName = Environment.GetEnvironmentVariable("GITHUB_PAT_CONNECTION_NAME")
-        ?? Environment.GetEnvironmentVariable("GITHUB_MCP_CONNECTION_NAME") // legacy name
-        ?? "github-pat-connection";
 
     Console.WriteLine($"[startup] Using project endpoint: {projectEndpoint}");
     Console.WriteLine($"[startup] Using model deployment: {modelDeployment}");
-    Console.WriteLine($"[startup] PAT fallback connection (optional): {patConnectionName}");
 
     // Credential selection.
     //
@@ -112,112 +100,29 @@ try
     }
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
 
-    // Block startup until the credential actually works. With Workload Identity
-    // the token exchange is usually instant (read a file, POST it to Entra),
-    // but if the federated token file is missing, unreadable, or stale, or if
-    // the trust between the agent identity and the project MI has drifted,
-    // we'd rather fail loud right here than serve 502s. The retry budget covers
-    // the rare case where the projected token volume isn't fully mounted yet
-    // at process start. On final failure we throw, the .NET process exits,
-    // and Foundry restarts the container on a clean slate.
-    WarmUpCredential(credential);
+    // NOTE: we deliberately do NOT perform any blocking I/O between here and
+    // `app.Run()` below. Earlier revisions did a `WarmUpCredential` token
+    // exchange (up to ~67s of retries) and a synchronous PAT-connection
+    // lookup before binding Kestrel; both of those run while the container
+    // has no port listening, so Foundry's `/readiness` probe gets
+    // connection-refused and (since its readiness timeout is ~60s) the
+    // gateway returns `424 session_not_ready` to the caller. The "fix" was
+    // self-inflicted. Auth is now lazy: the first real request triggers the
+    // Workload Identity token exchange (a file read + Entra POST, ~50-200ms);
+    // if it fails transiently the workflow's bash retry loop covers it.
 
-    static void WarmUpCredential(Azure.Core.TokenCredential credential)
-    {
-        // Cognitive Services scope — covers all Foundry / Azure OpenAI calls
-        // the agent makes downstream. Any working scope proves the credential
-        // chain can issue tokens for the resources we actually call.
-        var ctx = new Azure.Core.TokenRequestContext(new[] { "https://cognitiveservices.azure.com/.default" });
-        var backoffs = new[] { 2, 5, 10, 20, 30 }; // 5 retries, ~67s budget
-        Exception? lastError = null;
-        var totalSw = System.Diagnostics.Stopwatch.StartNew();
-        for (var attempt = 0; attempt <= backoffs.Length; attempt++)
-        {
-            try
-            {
-                var attemptSw = System.Diagnostics.Stopwatch.StartNew();
-                var token = credential.GetToken(ctx, default);
-                Console.WriteLine(
-                    $"[startup] Credential warm-up OK on attempt {attempt + 1} " +
-                    $"in {attemptSw.ElapsedMilliseconds}ms (token expires {token.ExpiresOn:O}, " +
-                    $"total wall {totalSw.ElapsedMilliseconds}ms).");
-                return;
-            }
-            catch (Exception ex)
-            {
-                lastError = ex;
-                var firstLine = ex.Message.Split('\n', 2)[0];
-                if (attempt < backoffs.Length)
-                {
-                    var delaySec = backoffs[attempt];
-                    Console.WriteLine(
-                        $"[startup] Credential warm-up attempt {attempt + 1} failed " +
-                        $"({ex.GetType().Name}: {firstLine}) — retrying in {delaySec}s.");
-                    System.Threading.Thread.Sleep(TimeSpan.FromSeconds(delaySec));
-                }
-            }
-        }
-        Console.WriteLine(
-            $"[startup] Credential warm-up FAILED after {backoffs.Length + 1} attempts " +
-            $"({totalSw.ElapsedMilliseconds}ms total). Exiting so Foundry restarts the container.");
-        throw new InvalidOperationException(
-            "Credential warm-up failed; refusing to start agent to avoid serving 502s.",
-            lastError);
-    }
-
-    string? fallbackToken = null;
-    try
-    {
-        Console.WriteLine($"[startup] Attempting to read fallback PAT from connection '{patConnectionName}'...");
-        var connection = projectClient.Connections
-            .GetConnectionAsync(patConnectionName, includeCredentials: true)
-            .GetAwaiter().GetResult();
-
-        if (connection.Value.Credentials is AIProjectConnectionCustomCredential customCreds)
-        {
-            Console.WriteLine($"[startup] Connection has {customCreds.Keys.Count} key(s): [{string.Join(", ", customCreds.Keys.Keys)}]");
-            string? authHeader = null;
-            foreach (var kv in customCreds.Keys)
-            {
-                if (string.Equals(kv.Key, "Authorization", StringComparison.OrdinalIgnoreCase))
-                {
-                    authHeader = kv.Value;
-                    break;
-                }
-            }
-            if (!string.IsNullOrWhiteSpace(authHeader))
-            {
-                fallbackToken = authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
-                    ? authHeader["Bearer ".Length..].Trim()
-                    : authHeader.Trim();
-                Console.WriteLine($"[startup] Fallback PAT loaded ({fallbackToken.Length} chars).");
-            }
-            else
-            {
-                Console.WriteLine($"[startup] Connection has no 'Authorization' key — running without PAT fallback.");
-            }
-        }
-        else
-        {
-            var actualType = connection.Value.Credentials?.GetType().FullName ?? "(null)";
-            Console.WriteLine($"[startup] Connection credentials type is '{actualType}' (expected CustomKeys) — running without PAT fallback.");
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[startup] PAT connection unavailable ({ex.GetType().Name}: {ex.Message}) — running without PAT fallback. Direct CLI invocations will fail; workflow path is unaffected.");
-    }
-
-    // GitHub identity strategy:
-    //   - Preferred path (production): workflow mints a GitHub App installation
-    //     token per run and sends it in the JSON body field `github_token`.
-    //     TriageInvocationHandler pushes it onto GitHubTokenProvider's AsyncLocal.
-    //     GitHubRestTools.SendAsync reads it for every outbound GitHub REST call,
-    //     so the agent posts/labels as `<app>[bot]` with its own identity.
-    //   - Fallback path (CLI / local testing, OPTIONAL): the PAT from the
-    //     Foundry connection above. Skipped entirely if the connection isn't
-    //     configured.
-    var tokenProvider = new GitHubTokenProvider(fallbackToken);
+    // GitHub identity:
+    //   - The workflow mints a per-run GitHub App installation token and
+    //     sends it in the JSON body field `github_token`.
+    //     TriageInvocationHandler pushes it onto GitHubTokenProvider's
+    //     AsyncLocal, and GitHubRestTools reads it for every outbound REST
+    //     call so the agent posts/labels as `<app>[bot]`.
+    //   - There is no static fallback. CLI invocations without a body
+    //     `github_token` will fail with "no GitHub token in scope", which is
+    //     the desired behaviour — the alternative (a static PAT in a Foundry
+    //     connection) was previously fetched on every startup, blocked
+    //     readiness, and is never exercised in production anyway.
+    var tokenProvider = new GitHubTokenProvider();
 
     // GitHub write tools, called via REST (api.github.com) directly. See
     // GitHubRestTools.cs for the full rationale (why not the Copilot MCP
