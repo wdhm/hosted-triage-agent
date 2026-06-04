@@ -158,13 +158,15 @@ public sealed class GitHubRestTools
             description: "Replace the entire label set on a GitHub issue with the given list. Any label that does not yet exist in the repo is created automatically with a default color. Returns the API response JSON."),
     ];
 
-    /// <summary>Tools exposed on the issue_comment.created path (comment only).</summary>
-    public List<AITool> FollowupTools() =>
-    [
-        AIFunctionFactory.Create(AddIssueCommentAsync,
-            name: "add_issue_comment",
-            description: "Post a markdown comment on a GitHub issue. Returns the API response JSON."),
-    ];
+    /// <summary>
+    /// Tools exposed on the issue_comment.created (follow-up) path.
+    /// Intentionally empty: the handler streams the model's markdown reply
+    /// directly into a placeholder comment via <see cref="ReplaceCommentBodyAsync"/>.
+    /// Giving the model no tools eliminates double-post risk and turns the
+    /// follow-up into a pure text-generation task that the runtime can
+    /// throttle-PATCH into the issue as tokens arrive.
+    /// </summary>
+    public List<AITool> FollowupTools() => [];
 
     [Description("Post a markdown comment on a GitHub issue.")]
     public async Task<string> AddIssueCommentAsync(
@@ -427,6 +429,65 @@ public sealed class GitHubRestTools
     {
         var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(sessionJson));
         return $"{FoundrySessionMarkerPrefix}{b64}{FoundrySessionMarkerSuffix}";
+    }
+
+    /// <summary>
+    /// PATCHes an existing comment by replacing its <c>body</c> wholesale.
+    /// Used by the streaming follow-up path: we own the full content (header +
+    /// accumulated model tokens + footer), so no GET round-trip needed.
+    /// Returns true on 200/201 from GitHub, false otherwise (logged).
+    /// </summary>
+    public async Task<bool> ReplaceCommentBodyAsync(
+        string owner, string repo, long commentId, string newBody,
+        CancellationToken cancellationToken = default)
+    {
+        using var activity = s_activitySource.StartActivity("replace_comment_body", ActivityKind.Client);
+        activity?.SetTag("github.owner", owner);
+        activity?.SetTag("github.repo", repo);
+        activity?.SetTag("github.comment_id", commentId);
+        activity?.SetTag("github.body.length", newBody.Length);
+
+        var token = _tokens.GetToken();
+        if (string.IsNullOrEmpty(token))
+        {
+            activity?.SetStatus(ActivityStatusCode.Error);
+            return false;
+        }
+
+        var payload = JsonSerializer.Serialize(new { body = newBody });
+        using var patchReq = new HttpRequestMessage(HttpMethod.Patch,
+            $"repos/{owner}/{repo}/issues/comments/{commentId}")
+        {
+            Content = new StringContent(payload, Encoding.UTF8, "application/json"),
+        };
+        patchReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", StripBearer(token));
+        using var patchResp = await _http.SendAsync(patchReq, cancellationToken);
+        if (!patchResp.IsSuccessStatusCode)
+        {
+            var patchBody = await patchResp.Content.ReadAsStringAsync(cancellationToken);
+            Console.WriteLine($"[REST-ERR] replace_comment {owner}/{repo}#{commentId}: HTTP {(int)patchResp.StatusCode} {Trunc(patchBody, 400)}");
+            activity?.SetStatus(ActivityStatusCode.Error);
+            return false;
+        }
+        activity?.SetTag("http.success", true);
+        return true;
+    }
+
+    /// <summary>
+    /// Builds the standard trace-footer block that <see cref="AddIssueCommentAsync"/>
+    /// appends to every bot comment. Exposed so the streaming follow-up path can
+    /// assemble equivalent bodies on each PATCH (the model output goes between
+    /// the bot header and this footer). Returns the empty string when no OTel
+    /// trace ID is in scope.
+    /// </summary>
+    public string BuildTraceFooter()
+    {
+        var traceId = _traceId.Value;
+        if (string.IsNullOrEmpty(traceId)) return string.Empty;
+        return "\n\n---\n" +
+               $"<sub>🔎 <b>Foundry trace</b>: <code>{traceId}</code> — open App Insights Logs and run " +
+               $"<code>union requests, dependencies, traces, exceptions | where operation_Id == \"{traceId}\"</code></sub>" +
+               $"\n<!-- foundry-trace:{traceId} -->";
     }
 
     /// <summary>
