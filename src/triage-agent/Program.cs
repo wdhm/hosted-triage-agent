@@ -76,6 +76,65 @@ try
     }
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
 
+    // Block startup until the credential actually works. Foundry's IMDS
+    // endpoint is occasionally not ready when the container starts processing
+    // requests — observed empirically as a wave of
+    // "ManagedIdentityCredential authentication failed: No response received
+    // from the managed identity endpoint" exceptions filling App Insights,
+    // with Foundry returning 502 to every retry. The workflow's curl retry
+    // loop then keeps re-firing the agent, which (because the placeholder is
+    // posted before the LLM call) floods the issue with thinking comments.
+    //
+    // Fix: try to acquire a token now. Retry with exponential backoff for
+    // ~67s. If MI still fails after that, throw — the .NET process exits,
+    // Foundry restarts the container, and the next boot gets a fresh shot
+    // at a working IMDS. By the time we reach `app.Run()` below, MI is known
+    // good for the lifetime of this container (the SDK caches tokens).
+    WarmUpCredential(credential);
+
+    static void WarmUpCredential(Azure.Core.TokenCredential credential)
+    {
+        // Cognitive Services scope — covers all Foundry / Azure OpenAI calls
+        // the agent makes downstream. Any working scope proves IMDS is alive.
+        var ctx = new Azure.Core.TokenRequestContext(new[] { "https://cognitiveservices.azure.com/.default" });
+        var backoffs = new[] { 2, 5, 10, 20, 30 }; // 5 retries, ~67s budget
+        Exception? lastError = null;
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+        for (var attempt = 0; attempt <= backoffs.Length; attempt++)
+        {
+            try
+            {
+                var attemptSw = System.Diagnostics.Stopwatch.StartNew();
+                var token = credential.GetToken(ctx, default);
+                Console.WriteLine(
+                    $"[startup] Credential warm-up OK on attempt {attempt + 1} " +
+                    $"in {attemptSw.ElapsedMilliseconds}ms (token expires {token.ExpiresOn:O}, " +
+                    $"total wall {totalSw.ElapsedMilliseconds}ms).");
+                return;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                var firstLine = ex.Message.Split('\n', 2)[0];
+                if (attempt < backoffs.Length)
+                {
+                    var delaySec = backoffs[attempt];
+                    Console.WriteLine(
+                        $"[startup] Credential warm-up attempt {attempt + 1} failed " +
+                        $"({ex.GetType().Name}: {firstLine}) — retrying in {delaySec}s.");
+                    System.Threading.Thread.Sleep(TimeSpan.FromSeconds(delaySec));
+                }
+            }
+        }
+        Console.WriteLine(
+            $"[startup] Credential warm-up FAILED after {backoffs.Length + 1} attempts " +
+            $"({totalSw.ElapsedMilliseconds}ms total). Exiting so Foundry restarts the container " +
+            $"with a fresh IMDS.");
+        throw new InvalidOperationException(
+            "Managed identity warm-up failed; refusing to start agent to avoid serving 502s.",
+            lastError);
+    }
+
     string? fallbackToken = null;
     try
     {
