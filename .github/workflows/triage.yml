@@ -129,14 +129,40 @@ jobs:
           # MUST append session id with '&' (not '?'). Two '?' chars cause Foundry
           # to reject with HTTP 400 "API version not supported" because the parser
           # reads api-version's value as "v1?agent_session_id=...".
-          HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -H "Foundry-Features: HostedAgents=V1Preview" \
-            --data-binary @/tmp/payload.json \
-            --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 \
-            -o /tmp/reply.txt \
-            -w '%{http_code}')
+          #
+          # Retry loop: Foundry returns HTTP 424 session_not_ready under
+          # simultaneous cold-starts (e.g., burst of N parallel issues) while
+          # it spins up container instances. curl's --retry doesn't fire on
+          # 4xx because the server "replied successfully" from curl's view —
+          # so we own the retry in bash. Backoff: 8s, 16s, 32s. 408 / 425 /
+          # 429 / 5xx also retried; everything else (including 200) breaks.
+          attempt=0
+          max_attempts=4
+          while : ; do
+            attempt=$((attempt+1))
+            HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Foundry-Features: HostedAgents=V1Preview" \
+              --data-binary @/tmp/payload.json \
+              --max-time 120 \
+              -o /tmp/reply.txt \
+              -w '%{http_code}')
+            echo "Attempt ${attempt}/${max_attempts}: HTTP ${HTTP_CODE}"
+            case "$HTTP_CODE" in
+              200) break ;;
+              408|424|425|429|5??)
+                if [ "$attempt" -ge "$max_attempts" ]; then
+                  echo "::warning::Giving up after ${attempt} attempts (last HTTP ${HTTP_CODE})."
+                  break
+                fi
+                backoff=$((8 * (2 ** (attempt - 1))))
+                echo "Transient HTTP ${HTTP_CODE} — sleeping ${backoff}s before retry."
+                sleep "$backoff"
+                ;;
+              *) break ;;
+            esac
+          done
           echo "HTTP: $HTTP_CODE"
           echo "Agent response body:"
           cat /tmp/reply.txt
