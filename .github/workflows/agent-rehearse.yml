@@ -53,11 +53,11 @@ jobs:
           # Same retry loop as triage.yml — Foundry returns 424
           # session_not_ready while a cold container spins up, which a probe
           # MUST tolerate (otherwise every post-deploy ping races cold-start
-          # and cries wolf). 4 attempts, exponential backoff 8/16/32s. Real
-          # outages (today's Foundry MI regression) exhaust all retries and
-          # fail loudly with the final HTTP code.
+          # Same 5-attempt / 180s-max-time / 8-16-32-64s-backoff retry loop
+          # the production triage.yml uses, tuned from burst-load evidence.
+          # Without it the post-deploy hook races cold-start and cries wolf.
           attempt=0
-          max_attempts=4
+          max_attempts=5
           while : ; do
             attempt=$((attempt+1))
             set +e
@@ -66,7 +66,7 @@ jobs:
               -H "Content-Type: application/json" \
               -H "Foundry-Features: HostedAgents=V1Preview" \
               --data-binary @/tmp/payload.json \
-              --max-time 90 \
+              --max-time 180 \
               -o /tmp/reply.txt \
               -w '%{http_code}')
             CURL_EXIT=$?
