@@ -51,7 +51,29 @@ try
     Console.WriteLine($"[startup] Using model deployment: {modelDeployment}");
     Console.WriteLine($"[startup] PAT fallback connection (optional): {patConnectionName}");
 
-    var credential = new Azure.Identity.DefaultAzureCredential();
+    // Use ManagedIdentityCredential directly when AZURE_CLIENT_ID is set
+    // (Foundry hosted runtime injects it). DefaultAzureCredential probes
+    // through Environment → WorkloadIdentity → MI → AzureCli → … in series,
+    // each with its own IMDS round-trip — that probe chain burns 10-30s on
+    // a cold start and demonstrably widens the IMDS race we observed under
+    // burst load (3+ simultaneous cold-starts, 3 of 5 issues failed in the
+    // burst test on v34 with ManagedIdentityCredential MI exceptions filling
+    // the App Insights exceptions table for those issues' 7-min retry budget).
+    // Targeting the credential directly cuts startup auth from ~15s to ~2s.
+    // Falls back to DefaultAzureCredential when AZURE_CLIENT_ID is unset
+    // (i.e., local `dotnet run` against an az login session).
+    var azureClientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
+    Azure.Core.TokenCredential credential;
+    if (!string.IsNullOrWhiteSpace(azureClientId))
+    {
+        Console.WriteLine($"[startup] Using ManagedIdentityCredential (clientId={azureClientId[..Math.Min(8, azureClientId.Length)]}…).");
+        credential = new Azure.Identity.ManagedIdentityCredential(azureClientId);
+    }
+    else
+    {
+        Console.WriteLine("[startup] AZURE_CLIENT_ID not set — falling back to DefaultAzureCredential (local-dev path).");
+        credential = new Azure.Identity.DefaultAzureCredential();
+    }
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
 
     string? fallbackToken = null;

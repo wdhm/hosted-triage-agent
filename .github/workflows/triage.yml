@@ -134,24 +134,36 @@ jobs:
           # simultaneous cold-starts (e.g., burst of N parallel issues) while
           # it spins up container instances. curl's --retry doesn't fire on
           # 4xx because the server "replied successfully" from curl's view —
-          # so we own the retry in bash. Backoff: 8s, 16s, 32s. 408 / 425 /
-          # 429 / 5xx also retried; everything else (including 200) breaks.
+          # so we own the retry in bash. Backoff: 8s, 16s, 32s, 64s. 408 /
+          # 425 / 429 / 5xx also retried; everything else (including 200)
+          # breaks.
+          #
+          # Budget tuned from live burst evidence (5-issue burst on v34: 3
+          # of 5 failed after ~7 min). Foundry's parallel cold-start tops
+          # out at 1-2 concurrent containers; bursts of 3+ queue at the
+          # gateway, and once one container hits the MI/IMDS race those
+          # requests can hang for 90-120s per attempt. 5 attempts × 180s
+          # max-time + 8/16/32/64s backoff = ~16 min ceiling, which
+          # comfortably absorbs deep cold-pool scale-up. Single-issue
+          # cold-start unaffected (still resolves in <60s on attempt 1-2).
           attempt=0
-          max_attempts=4
+          max_attempts=5
           while : ; do
             attempt=$((attempt+1))
             # Run curl in a way that does NOT trip `set -e` on failure: temporarily
             # disable -e around the call and capture both HTTP_CODE and curl's exit
             # status. Important because curl exit 28 (timeout) — which we WANT to
             # retry — would otherwise kill the script before the case below runs.
-            # --max-time 90 caps a single attempt; Foundry warm responses are <30s.
+            # --max-time 180 caps a single attempt; Foundry warm responses are <30s
+            # but burst-cold containers can take 90-120s to complete MI acquisition
+            # + first LLM call.
             set +e
             HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
               -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/json" \
               -H "Foundry-Features: HostedAgents=V1Preview" \
               --data-binary @/tmp/payload.json \
-              --max-time 90 \
+              --max-time 180 \
               -o /tmp/reply.txt \
               -w '%{http_code}')
             CURL_EXIT=$?
