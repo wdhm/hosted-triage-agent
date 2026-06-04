@@ -50,33 +50,55 @@ jobs:
           # are never inspected.
           jq -n '{event:"ping", owner:"_", repo:"_", issue_number:1}' > /tmp/payload.json
 
-          # Same curl-exit-trap pattern as triage.yml: temporarily disable -e
-          # so we can capture both the HTTP status AND curl's exit code,
-          # because `set -euo pipefail` would otherwise kill the script on a
-          # curl timeout before the assertion below could classify it.
-          set +e
-          HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -H "Foundry-Features: HostedAgents=V1Preview" \
-            --data-binary @/tmp/payload.json \
-            --max-time 120 \
-            -o /tmp/reply.txt \
-            -w '%{http_code}')
-          CURL_EXIT=$?
-          set -e
+          # Same retry loop as triage.yml — Foundry returns 424
+          # session_not_ready while a cold container spins up, which a probe
+          # MUST tolerate (otherwise every post-deploy ping races cold-start
+          # and cries wolf). 4 attempts, exponential backoff 8/16/32s. Real
+          # outages (today's Foundry MI regression) exhaust all retries and
+          # fail loudly with the final HTTP code.
+          attempt=0
+          max_attempts=4
+          while : ; do
+            attempt=$((attempt+1))
+            set +e
+            HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Foundry-Features: HostedAgents=V1Preview" \
+              --data-binary @/tmp/payload.json \
+              --max-time 90 \
+              -o /tmp/reply.txt \
+              -w '%{http_code}')
+            CURL_EXIT=$?
+            set -e
+            if [ "$CURL_EXIT" -ne 0 ]; then
+              echo "Attempt ${attempt}/${max_attempts}: curl exit=${CURL_EXIT} (HTTP=${HTTP_CODE:-none}) — treating as transient."
+              HTTP_CODE="000"
+            else
+              echo "Attempt ${attempt}/${max_attempts}: HTTP ${HTTP_CODE}"
+            fi
+            case "$HTTP_CODE" in
+              200) break ;;
+              000|408|424|425|429|5??)
+                if [ "$attempt" -ge "$max_attempts" ]; then
+                  echo "::warning::Giving up after ${attempt} attempts (last HTTP ${HTTP_CODE})."
+                  break
+                fi
+                backoff=$((8 * (2 ** (attempt - 1))))
+                echo "Transient HTTP ${HTTP_CODE} — sleeping ${backoff}s before retry."
+                sleep "$backoff"
+                ;;
+              *) break ;;
+            esac
+          done
 
-          echo "HTTP: ${HTTP_CODE} (curl exit ${CURL_EXIT})"
+          echo "Final HTTP: ${HTTP_CODE} (last curl exit ${CURL_EXIT})"
           echo "Body:"
           cat /tmp/reply.txt
           echo
 
-          if [ "$CURL_EXIT" -ne 0 ]; then
-            echo "::error::Agent rehearse FAILED — curl exit ${CURL_EXIT} (transport/timeout)."
-            exit 1
-          fi
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Agent rehearse FAILED — expected HTTP 200, got ${HTTP_CODE}."
+            echo "::error::Agent rehearse FAILED — expected HTTP 200, got ${HTTP_CODE} after ${attempt} attempts."
             exit 1
           fi
           if ! grep -q '^OK: pong' /tmp/reply.txt; then
