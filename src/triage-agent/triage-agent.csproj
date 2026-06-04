@@ -13,7 +13,22 @@
     <PackageReference Include="Microsoft.Agents.AI.Foundry.Hosting" Version="1.9.0-preview.260603.1" />
     <PackageReference Include="Azure.AI.AgentServer.Invocations" Version="1.0.0-beta.4" />
     <PackageReference Include="Azure.AI.Projects" Version="2.1.0-beta.3" />
-    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.5.0" />
+    <!-- Microsoft.Extensions.AI.Abstractions: explicit floor of 10.6.0.
+         Microsoft.Agents.AI.Foundry.Hosting 1.9.0 was compiled against the
+         Microsoft.Extensions.AI.Abstractions 10.6.x assembly and calls
+         into types added in that release (e.g. HostedToolSearchTool).
+         The transitive resolution under Foundry.Hosting 1.9.0 only floors
+         at 10.5.x, so without this explicit floor the resolver lands on
+         10.5.x and the agent dies at first invocation with:
+             TypeLoadException: Could not load type
+             'Microsoft.Extensions.AI.HostedToolSearchTool' from assembly
+             'Microsoft.Extensions.AI.Abstractions, Version=10.5.0.0'
+         Pinning to 10.6.0 here forces the 10.6.x assembly into the
+         deployment. Same binding-by-assembly-version trap as the OTel
+         packages below — keep this version in sync with whatever
+         Foundry.Hosting was last compiled against (check the runtime
+         exception text on bump). -->
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.6.0" />
     <!-- OpenTelemetry: we deliberately reference ONLY Extensions.Hosting (so we
          can call builder.Services.AddOpenTelemetry().WithTracing(...)). All other
          OTel packages — Api, Sdk, Instrumentation.Http, Instrumentation.AspNetCore,
