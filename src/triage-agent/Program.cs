@@ -1,5 +1,6 @@
 using Azure.AI.AgentServer.Invocations;
 using Azure.AI.Projects;
+using Azure.Identity;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using OpenTelemetry.Resources;
@@ -7,42 +8,6 @@ using OpenTelemetry.Trace;
 using TriageAgent;
 
 #pragma warning disable MEAI001, OPENAI001
-
-// ── Process-wide Azure.Identity lock ─────────────────────────────────────
-// Foundry Hosted Agents authenticate via Workload Identity Federation. The
-// runtime injects AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_FEDERATED_TOKEN_FILE
-// for us. The trap: even if WE construct our project credential as
-// `new WorkloadIdentityCredential()` (or DefaultAzureCredential with MI
-// excluded), other SDK components in the process — telemetry exporters,
-// transitive Azure clients — can still call `new DefaultAzureCredential()`
-// with no options, which probes the full chain including ManagedIdentity →
-// IMDS. IMDS is broken on Foundry containers (returns HTTP 500) so each
-// probe burns ~22s of MSAL exponential backoff before falling through.
-// We observed the followup-agent path doing this and turning every comment
-// reply into a 3-minute timeout (six failed token attempts inside one
-// invoke_agent span; Foundry sees 502, internally re-routes, eventually
-// succeeds on retry #5).
-//
-// Fix: set AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential BEFORE any
-// Azure SDK initialisation. Azure.Identity ≥ 1.15.0 (we're on 1.21) honours
-// this env var inside `DefaultAzureCredentialFactory.CreateCredentialChain()`
-// and builds a one-element chain containing only WorkloadIdentityCredential
-// — no IMDS probe, anywhere in the process, ever. Confirmed against
-// Azure/azure-sdk-for-net source:
-//   sdk/core/Azure.Core/src/Identity/DefaultAzureCredentialFactory.cs
-//   sdk/core/Azure.Core/src/Identity/Constants.cs
-// We only set it if not already set (so the operator can override via
-// container env / azure.yaml) and only when AZURE_FEDERATED_TOKEN_FILE is
-// present (i.e. we're actually in a Workload Identity environment, not on
-// a local `dotnet run` against `az login`).
-if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AZURE_FEDERATED_TOKEN_FILE"))
-    && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZURE_TOKEN_CREDENTIALS")))
-{
-    Environment.SetEnvironmentVariable("AZURE_TOKEN_CREDENTIALS", "WorkloadIdentityCredential");
-    Console.WriteLine(
-        "[startup] AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential set in-process " +
-        "(locks every DefaultAzureCredential in the process to WIF, no IMDS probe).");
-}
 
 // Early-startup diagnostics — written to stdout BEFORE App Insights is wired so
 // we can see boot failures even if telemetry export hasn't initialized.
@@ -83,45 +48,24 @@ try
     Console.WriteLine($"[startup] Using project endpoint: {projectEndpoint}");
     Console.WriteLine($"[startup] Using model deployment: {modelDeployment}");
 
-    // Credential selection.
+    // Credential: plain DefaultAzureCredential, matching the official Foundry
+    // hosted-agents samples
+    // (microsoft-foundry/foundry-samples/samples/csharp/hosted-agents/agent-framework/*).
     //
-    // Foundry Hosted Agents authenticate via Workload Identity Federation
-    // (the AKS pattern): the runtime injects AZURE_TENANT_ID +
-    // AZURE_CLIENT_ID + AZURE_FEDERATED_TOKEN_FILE, and Azure.Identity's
-    // WorkloadIdentityCredential reads the projected token file and
-    // exchanges it directly with Entra ID — no IMDS round-trip required.
+    // The Foundry runtime injects AZURE_CLIENT_ID + AZURE_TENANT_ID pointing at
+    // the agent identity (an Entra service principal that azd auto-creates and
+    // grants the `Foundry User` role at project scope — verified via
+    // `az role assignment list --assignee $AZURE_CLIENT_ID --all`). DAC reads
+    // those env vars and authenticates through ManagedIdentityCredential with
+    // the right client_id; no manual wiring needed. Outside Foundry (local
+    // `dotnet run`) DAC falls back to AzureCliCredential / VisualStudio etc.
     //
-    // We use `new WorkloadIdentityCredential()` explicitly (rather than
-    // DefaultAzureCredential with MI excluded) because:
-    //   1. It's a single credential, no chain, no probing, no startup
-    //      latency from EnvironmentCredential probes.
-    //   2. It cannot silently fall back to anything else if Foundry's WIF
-    //      wiring breaks — we fail loud, which is what we want.
-    //   3. Combined with AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential
-    //      set at the top of this file, ANY downstream
-    //      `new DefaultAzureCredential()` in the process (telemetry
-    //      exporters, transitive Azure clients) is also locked to WIF only.
-    //
-    // Outside Foundry (local `dotnet run` against `az login`), we drop to
-    // plain DefaultAzureCredential so AzureCliCredential / VisualStudioCredential
-    // / etc. can resolve.
-    var federatedTokenFile = Environment.GetEnvironmentVariable("AZURE_FEDERATED_TOKEN_FILE");
-    var inFoundryWorkloadIdentity = !string.IsNullOrWhiteSpace(federatedTokenFile);
-    Azure.Core.TokenCredential credential;
-    if (inFoundryWorkloadIdentity)
-    {
-        Console.WriteLine(
-            $"[startup] Workload Identity detected (AZURE_FEDERATED_TOKEN_FILE set). " +
-            $"Using WorkloadIdentityCredential directly — no chain, no IMDS, no fallback.");
-        credential = new Azure.Identity.WorkloadIdentityCredential();
-    }
-    else
-    {
-        Console.WriteLine(
-            "[startup] No AZURE_FEDERATED_TOKEN_FILE — using full DefaultAzureCredential " +
-            "chain (local dev: az login / VS / etc.).");
-        credential = new Azure.Identity.DefaultAzureCredential();
-    }
+    // We previously had a `new WorkloadIdentityCredential()` branch gated on
+    // AZURE_FEDERATED_TOKEN_FILE plus an in-process AZURE_TOKEN_CREDENTIALS
+    // env-var lock — that was cargo-culted from an AKS-style WIF setup that
+    // Foundry does NOT use. Confirmed by App Insights traces showing zero WIF
+    // activity and a working user-assigned MI cache entry for our AZURE_CLIENT_ID.
+    var credential = new DefaultAzureCredential();
     var projectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
 
     // NOTE: we deliberately do NOT perform any blocking I/O between here and
@@ -197,23 +141,23 @@ try
 
     // ── OpenTelemetry source registration ─────────────────────────────────
     // Foundry's AgentHostBuilder already wires the Azure Monitor exporter
-    // internally (it calls UseAzureMonitor in Build()). We layer source
-    // registrations onto the SAME OpenTelemetryBuilder so our spans flow
-    // to the same App Insights resource — do NOT call AddAzureMonitorTraceExporter
-    // here, that would create a second exporter and double-publish.
+    // internally (it calls UseAzureMonitor in Build()) AND Foundry's
+    // Agent365Exporter auto-subscribes to "Experimental.Microsoft.Extensions.AI"
+    // for gen_ai.chat / execute_tool spans on the IAgentInvocationHandler path
+    // (Microsoft.Agents.AI.Foundry.Hosting ≥ 1.6.1, PR #5750 in agent-framework).
+    // We MUST NOT register that source again — Foundry's ExportFormatter
+    // crashes with `An item with the same key has already been added.
+    // Key: openai.api.type` when the same span attribute set is materialised
+    // twice (observed in App Insights on v39, stack lands in
+    // Microsoft.Agents.A365.Observability.Runtime.Common.ExportFormatter.MapAttributes).
     //
-    // Sources MUST match what the runtime actually emits on (verified against
-    // microsoft/agent-framework + MEAI source). On the IAgentInvocationHandler
-    // path:
-    //   - "Experimental.Microsoft.Agents.AI"      → invoke_agent spans
-    //     (emitted only because we explicitly wrap each agent with
-    //     UseOpenTelemetry above — AddFoundryResponses would auto-wrap, the
-    //     invocations path does not).
-    //   - "Experimental.Microsoft.Extensions.AI"  → per-LLM-call gen_ai.chat
-    //     spans + execute_tool <name> spans (model, prompt/completion
-    //     tokens, latency; raw text excluded — EnableSensitiveData=false).
+    // What we DO still need to register:
+    //   - "Experimental.Microsoft.Agents.AI"      → invoke_agent spans (we
+    //     wrap each agent above with UseOpenTelemetry, which emits on this
+    //     source; AddFoundryResponses auto-wraps but the invocations path
+    //     does not).
     //   - "Azure.AI.AgentServer.Invocations"      → baggage propagation from
-    //     the invocations endpoint handler (no span itself in beta.4).
+    //     the invocations endpoint handler.
     //   - "TriageAgent.Tools"                     → explicit tool spans we
     //     emit inside GitHubRestTools as a belt-and-braces guarantee that
     //     the demo always shows the REST calls in the trace tree.
@@ -228,7 +172,6 @@ try
         .ConfigureResource(r => r.AddService("triage-agent", serviceVersion: "1.0"))
         .WithTracing(t => t
             .AddSource("Experimental.Microsoft.Agents.AI")
-            .AddSource("Experimental.Microsoft.Extensions.AI")
             .AddSource("Azure.AI.AgentServer.Invocations")
             .AddSource(GitHubRestTools.ActivitySourceName));
 
