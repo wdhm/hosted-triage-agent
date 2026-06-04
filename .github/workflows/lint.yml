@@ -1,0 +1,41 @@
+name: Lint workflows
+
+# Catch bash-in-YAML mistakes BEFORE they merge. actionlint embeds shellcheck
+# for `run:` blocks, which would have flagged the `set -euo pipefail` +
+# `HTTP_CODE=$(curl …)` exit-code-masking bug we hit in PR #56 at PR-review
+# time instead of at 2am on a customer issue.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run actionlint
+        # actionlint discovers .github/workflows/*.yml and runs shellcheck on
+        # all `run:` blocks automatically (`-shellcheck=shellcheck` is the
+        # default when the binary is on PATH). `-color` keeps the diagnostics
+        # readable in the Actions log.
+        run: actionlint -color

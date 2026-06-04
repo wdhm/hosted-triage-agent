@@ -1,0 +1,86 @@
+name: Agent rehearse
+
+# Manual liveness probe for the hosted Foundry triage agent. POSTs a
+# side-effect-free `event: "ping"` payload to the live invocations endpoint
+# and asserts HTTP 200 "OK: pong …". Doesn't mint a GitHub App token, doesn't
+# call the LLM, doesn't touch any issue. Use this AFTER an `azd deploy` (or
+# at any time) to confirm the agent is reachable in <2 min instead of
+# discovering an outage via a real user opening a real issue.
+#
+# Run it from the Actions tab → "Agent rehearse" → "Run workflow", or via
+# `gh workflow run agent-rehearse.yml`.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC into Azure for the bearer token
+  contents: read
+
+# Don't pile rehearsals on top of each other. They're cheap, but stacking
+# them gives noisy concurrent telemetry that obscures real signal.
+concurrency:
+  group: agent-rehearse-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ping Foundry hosted agent
+        env:
+          INVOCATIONS_URL: ${{ vars.FOUNDRY_INVOCATIONS_URL }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
+
+          # Distinct, run-scoped session id so a rehearsal never collides with
+          # a real issue thread on the Foundry Responses-API server.
+          SESSION_ID="gh-rehearse-${GITHUB_RUN_ID}"
+
+          # Minimal payload. The handler short-circuits on `event:"ping"` BEFORE
+          # the owner/repo/issue_number validation, so the dummy values below
+          # are never inspected.
+          jq -n '{event:"ping", owner:"_", repo:"_", issue_number:1}' > /tmp/payload.json
+
+          # Same curl-exit-trap pattern as triage.yml: temporarily disable -e
+          # so we can capture both the HTTP status AND curl's exit code,
+          # because `set -euo pipefail` would otherwise kill the script on a
+          # curl timeout before the assertion below could classify it.
+          set +e
+          HTTP_CODE=$(curl -sS -X POST "${INVOCATIONS_URL}&agent_session_id=${SESSION_ID}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Foundry-Features: HostedAgents=V1Preview" \
+            --data-binary @/tmp/payload.json \
+            --max-time 120 \
+            -o /tmp/reply.txt \
+            -w '%{http_code}')
+          CURL_EXIT=$?
+          set -e
+
+          echo "HTTP: ${HTTP_CODE} (curl exit ${CURL_EXIT})"
+          echo "Body:"
+          cat /tmp/reply.txt
+          echo
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::Agent rehearse FAILED — curl exit ${CURL_EXIT} (transport/timeout)."
+            exit 1
+          fi
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Agent rehearse FAILED — expected HTTP 200, got ${HTTP_CODE}."
+            exit 1
+          fi
+          if ! grep -q '^OK: pong' /tmp/reply.txt; then
+            echo "::error::Agent rehearse FAILED — HTTP 200 but body did not match 'OK: pong …'."
+            exit 1
+          fi
+          echo "::notice::Agent rehearse OK — container is alive and Foundry routing works."
