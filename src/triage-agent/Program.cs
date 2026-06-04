@@ -8,6 +8,42 @@ using TriageAgent;
 
 #pragma warning disable MEAI001, OPENAI001
 
+// ── Process-wide Azure.Identity lock ─────────────────────────────────────
+// Foundry Hosted Agents authenticate via Workload Identity Federation. The
+// runtime injects AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_FEDERATED_TOKEN_FILE
+// for us. The trap: even if WE construct our project credential as
+// `new WorkloadIdentityCredential()` (or DefaultAzureCredential with MI
+// excluded), other SDK components in the process — telemetry exporters,
+// transitive Azure clients — can still call `new DefaultAzureCredential()`
+// with no options, which probes the full chain including ManagedIdentity →
+// IMDS. IMDS is broken on Foundry containers (returns HTTP 500) so each
+// probe burns ~22s of MSAL exponential backoff before falling through.
+// We observed the followup-agent path doing this and turning every comment
+// reply into a 3-minute timeout (six failed token attempts inside one
+// invoke_agent span; Foundry sees 502, internally re-routes, eventually
+// succeeds on retry #5).
+//
+// Fix: set AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential BEFORE any
+// Azure SDK initialisation. Azure.Identity ≥ 1.15.0 (we're on 1.21) honours
+// this env var inside `DefaultAzureCredentialFactory.CreateCredentialChain()`
+// and builds a one-element chain containing only WorkloadIdentityCredential
+// — no IMDS probe, anywhere in the process, ever. Confirmed against
+// Azure/azure-sdk-for-net source:
+//   sdk/core/Azure.Core/src/Identity/DefaultAzureCredentialFactory.cs
+//   sdk/core/Azure.Core/src/Identity/Constants.cs
+// We only set it if not already set (so the operator can override via
+// container env / azure.yaml) and only when AZURE_FEDERATED_TOKEN_FILE is
+// present (i.e. we're actually in a Workload Identity environment, not on
+// a local `dotnet run` against `az login`).
+if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AZURE_FEDERATED_TOKEN_FILE"))
+    && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZURE_TOKEN_CREDENTIALS")))
+{
+    Environment.SetEnvironmentVariable("AZURE_TOKEN_CREDENTIALS", "WorkloadIdentityCredential");
+    Console.WriteLine(
+        "[startup] AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential set in-process " +
+        "(locks every DefaultAzureCredential in the process to WIF, no IMDS probe).");
+}
+
 // Early-startup diagnostics — written to stdout BEFORE App Insights is wired so
 // we can see boot failures even if telemetry export hasn't initialized.
 Console.WriteLine("[startup] triage-agent booting...");
@@ -49,33 +85,26 @@ try
 
     // Credential selection.
     //
-    // Foundry Hosted Agents authenticate via **Workload Identity Federation**
-    // (the AKS pattern): the runtime injects AZURE_TENANT_ID + AZURE_CLIENT_ID +
-    // AZURE_FEDERATED_TOKEN_FILE, and Azure.Identity's WorkloadIdentityCredential
-    // reads the projected token file and exchanges it with Entra ID directly —
-    // no IMDS round-trip required. This is what the official sample
-    // (microsoft-foundry/foundry-samples/.../hello-world/Program.cs) relies on
-    // when it does `new AIProjectClient(endpoint, new DefaultAzureCredential())`.
+    // Foundry Hosted Agents authenticate via Workload Identity Federation
+    // (the AKS pattern): the runtime injects AZURE_TENANT_ID +
+    // AZURE_CLIENT_ID + AZURE_FEDERATED_TOKEN_FILE, and Azure.Identity's
+    // WorkloadIdentityCredential reads the projected token file and
+    // exchanges it directly with Entra ID — no IMDS round-trip required.
     //
-    // PR #67 in this repo previously did `new ManagedIdentityCredential(AZURE_CLIENT_ID)`
-    // because we treated AZURE_CLIENT_ID as a signal to use IMDS-only MI. That
-    // was wrong: in Workload Identity environments AZURE_CLIENT_ID is set for
-    // the WorkloadIdentityCredential constructor, NOT to flag MI. Forcing the
-    // IMDS path meant every cold-start request lived or died by whether IMDS
-    // happened to be reachable from the Foundry container at that moment, which
-    // produced the wall of "ManagedIdentityCredential authentication failed:
-    // No response received from the managed identity endpoint" errors we saw.
+    // We use `new WorkloadIdentityCredential()` explicitly (rather than
+    // DefaultAzureCredential with MI excluded) because:
+    //   1. It's a single credential, no chain, no probing, no startup
+    //      latency from EnvironmentCredential probes.
+    //   2. It cannot silently fall back to anything else if Foundry's WIF
+    //      wiring breaks — we fail loud, which is what we want.
+    //   3. Combined with AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential
+    //      set at the top of this file, ANY downstream
+    //      `new DefaultAzureCredential()` in the process (telemetry
+    //      exporters, transitive Azure clients) is also locked to WIF only.
     //
-    // Strategy now (matches the official sample, with one production hardening):
-    //   - In Foundry (detected by AZURE_FEDERATED_TOKEN_FILE being set):
-    //     DefaultAzureCredential with ExcludeManagedIdentityCredential=true.
-    //     This locks the chain to Environment → WorkloadIdentity → (developer
-    //     creds, which never resolve in-container). No silent fallback to IMDS,
-    //     so if Foundry's federated token wiring ever breaks we fail loud
-    //     instead of accidentally trying a path that doesn't apply.
-    //   - Outside Foundry (no federated token file, e.g. local `dotnet run`
-    //     against `az login`): plain DefaultAzureCredential — full chain
-    //     including AzureCliCredential / VisualStudioCredential / etc.
+    // Outside Foundry (local `dotnet run` against `az login`), we drop to
+    // plain DefaultAzureCredential so AzureCliCredential / VisualStudioCredential
+    // / etc. can resolve.
     var federatedTokenFile = Environment.GetEnvironmentVariable("AZURE_FEDERATED_TOKEN_FILE");
     var inFoundryWorkloadIdentity = !string.IsNullOrWhiteSpace(federatedTokenFile);
     Azure.Core.TokenCredential credential;
@@ -83,13 +112,8 @@ try
     {
         Console.WriteLine(
             $"[startup] Workload Identity detected (AZURE_FEDERATED_TOKEN_FILE set). " +
-            $"Using DefaultAzureCredential with ManagedIdentityCredential excluded — " +
-            $"forces the WorkloadIdentityCredential path, no IMDS fallback.");
-        credential = new Azure.Identity.DefaultAzureCredential(
-            new Azure.Identity.DefaultAzureCredentialOptions
-            {
-                ExcludeManagedIdentityCredential = true,
-            });
+            $"Using WorkloadIdentityCredential directly — no chain, no IMDS, no fallback.");
+        credential = new Azure.Identity.WorkloadIdentityCredential();
     }
     else
     {
