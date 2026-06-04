@@ -152,13 +152,6 @@ try
     builder.Services.AddSingleton(tokenProvider);
     builder.Services.AddSingleton(restTools);
     builder.Services.AddSingleton(new AgentBundle(triageAgentOtel, followupAgentOtel));
-    builder.Services.AddSingleton<FoundrySessionStore>(sp =>
-        new FoundrySessionStore(
-            // Bind to the unwrapped ChatClientAgent so session (de)serialization
-            // is independent of the OpenTelemetry decorator. The bundle holds
-            // the wrapped versions for RunAsync; we keep this concern separate.
-            followupAgent,
-            sp.GetRequiredService<ILogger<FoundrySessionStore>>()));
     builder.Services.AddInvocationsServer();
     builder.Services.AddScoped<InvocationHandler, TriageInvocationHandler>();
 

@@ -41,6 +41,27 @@ public sealed class GitHubRestTools
     public const string ActivitySourceName = "TriageAgent.Tools";
     private static readonly ActivitySource s_activitySource = new(ActivitySourceName);
 
+    /// <summary>
+    /// Hidden HTML-comment marker used to embed the Foundry conversation
+    /// pointer (a tiny base64 blob, ~80 bytes) directly into a bot comment.
+    /// Wave 2 ("zero-local-state") uses the GitHub issue itself as the
+    /// durable store for the pointer — no container-local file, no Azure
+    /// Files mount, no Redis. The next turn scans bot comments newest-first
+    /// for this marker and resumes the conversation; if no marker is found
+    /// it starts fresh. The full conversation history still lives server-side
+    /// on the Foundry Responses API; only the ~24-byte pointer rides on GitHub.
+    /// </summary>
+    public const string FoundrySessionMarkerPrefix = "<!-- foundry-session:";
+    public const string FoundrySessionMarkerSuffix = " -->";
+
+    /// <summary>
+    /// Hidden HTML-comment marker the LLM emits at the end of every reply
+    /// (see TriageInvocationHandler system prompts). Used by the workflow
+    /// for loop prevention AND by the issue.opened idempotency check (any
+    /// bot comment carrying this marker means the issue has been triaged).
+    /// </summary>
+    public const string TriageReplyMarker = "<!-- triage-agent-reply -->";
+
     // Per-invocation success counters. AsyncLocal flows through agent.RunAsync
     // and the tool callbacks the framework triggers, so the handler can read
     // these post-run to verify the model actually completed its work — instead
@@ -54,6 +75,13 @@ public sealed class GitHubRestTools
     // Capturing once at the handler entry guarantees the comment footer holds
     // the canonical end-to-end W3C TraceId for the whole run.
     private static readonly AsyncLocal<string?> _traceId = new();
+
+    // Per-invocation ID of the LAST comment AddIssueCommentAsync successfully
+    // posted on this turn. Wave 2 ("zero-local-state") reads this after
+    // RunAsync to PATCH the comment with the Foundry conversation pointer,
+    // so the GitHub issue itself becomes the durable store for conversation
+    // continuity — no container-local file or volume needed.
+    private static readonly AsyncLocal<long?> _lastCommentId = new();
 
     private readonly HttpClient _http;
     private readonly GitHubTokenProvider _tokens;
@@ -81,7 +109,9 @@ public sealed class GitHubRestTools
     {
         var prev = _counters.Value;
         var prevTrace = _traceId.Value;
+        var prevComment = _lastCommentId.Value;
         _counters.Value = new Counters();
+        _lastCommentId.Value = null;
 
         // Capture the canonical end-to-end TraceId once, here. AspNetCore
         // instrumentation has already started the inbound request span by the
@@ -94,6 +124,7 @@ public sealed class GitHubRestTools
         {
             _counters.Value = prev;
             _traceId.Value = prevTrace;
+            _lastCommentId.Value = prevComment;
         });
     }
 
@@ -102,6 +133,16 @@ public sealed class GitHubRestTools
 
     /// <summary>Current invocation's canonical W3C trace ID (null if telemetry isn't initialized).</summary>
     public string? CurrentTraceId() => _traceId.Value;
+
+    /// <summary>
+    /// GitHub comment ID of the last comment <see cref="AddIssueCommentAsync"/>
+    /// posted on this turn. Used by the handler to PATCH the comment with the
+    /// Foundry conversation pointer after RunAsync succeeds. Stored on the
+    /// shared Counters reference (not via AsyncLocal slot assignment) so that
+    /// writes from inside FunctionInvokingChatClient's tool dispatch flow
+    /// back to the handler's ExecutionContext.
+    /// </summary>
+    public long? LastPostedCommentId => _counters.Value?.LastCommentId;
 
     private static bool IsValidTraceId(string? t) =>
         !string.IsNullOrEmpty(t) && t != "00000000000000000000000000000000";
@@ -163,12 +204,79 @@ public sealed class GitHubRestTools
         if (result.Success)
         {
             (_counters.Value ??= new Counters()).CommentsPosted++;
+            // Stash the just-created comment ID so the handler can PATCH it
+            // with the Foundry session marker after RunAsync returns. Prefer
+            // the Location header (rock-solid) and fall back to body parse.
+            var commentId = result.LocationCommentId ?? TryReadCommentId(result.Body, _logger);
+            if (commentId is null)
+            {
+                _logger.LogWarning(
+                    "Could not extract comment ID from POST response; Location={Location} bodyLen={BodyLen} bodyHead={Head}",
+                    result.Location ?? "(none)", result.Body?.Length ?? 0, Trunc(result.Body ?? "", 200));
+            }
+            _lastCommentId.Value = commentId;
+            // Also stash on the shared Counters object — AsyncLocal slot
+            // writes inside FunctionInvokingChatClient's tool dispatch don't
+            // propagate back to the handler's ExecutionContext, but mutations
+            // to a shared reference do. This is the channel the handler
+            // actually reads via LastPostedCommentId.
+            if (commentId is not null && _counters.Value is { } c)
+                c.LastCommentId = commentId;
         }
         else
         {
             activity?.SetStatus(ActivityStatusCode.Error);
         }
         return result.Body;
+    }
+
+    /// <summary>
+    /// Best-effort parse of a comment ID from a successful POST /comments
+    /// response. The response is the GitHub comment object, which always
+    /// includes an integer "id" at the top level. We silently return null
+    /// on parse failure — the marker PATCH just gets skipped and the next
+    /// turn starts a fresh conversation (no worse than today's behavior).
+    /// </summary>
+    private static long? TryReadCommentId(string responseBody, ILogger logger)
+    {
+        if (string.IsNullOrWhiteSpace(responseBody))
+        {
+            logger.LogWarning("TryReadCommentId: body is null/empty");
+            return null;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(responseBody);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                logger.LogWarning("TryReadCommentId: root is {Kind}, head={Head}",
+                    doc.RootElement.ValueKind, Trunc(responseBody, 200));
+                return null;
+            }
+            if (!doc.RootElement.TryGetProperty("id", out var idEl))
+            {
+                var keys = string.Join(",", doc.RootElement.EnumerateObject().Take(15).Select(p => p.Name));
+                logger.LogWarning("TryReadCommentId: no 'id' field; keys=[{Keys}] bodyLen={Len}",
+                    keys, responseBody.Length);
+                return null;
+            }
+            if (idEl.ValueKind != JsonValueKind.Number)
+            {
+                logger.LogWarning("TryReadCommentId: 'id' is {Kind} raw={Raw}", idEl.ValueKind, Trunc(idEl.GetRawText(), 100));
+                return null;
+            }
+            if (!idEl.TryGetInt64(out var id))
+            {
+                logger.LogWarning("TryReadCommentId: id not Int64 (raw={Raw})", idEl.GetRawText());
+                return null;
+            }
+            return id;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "TryReadCommentId: parse threw; head={Head}", Trunc(responseBody, 200));
+            return null;
+        }
     }
 
     [Description("Replace the labels on a GitHub issue with the provided list. Missing labels are auto-created.")]
@@ -208,6 +316,204 @@ public sealed class GitHubRestTools
         }
         return result.Body;
     }
+
+    // ── Wave 2: GitHub-as-state-store helpers ─────────────────────────────
+    // These are NOT exposed as AITools — the handler calls them directly to
+    // load and persist the Foundry conversation pointer via hidden HTML
+    // comments on the issue. Keeping them in this class so all GitHub REST
+    // I/O (auth header, base URL, error handling) goes through one path.
+
+    /// <summary>
+    /// Lists comments on an issue (oldest first per the GitHub API contract).
+    /// Pages through up to <paramref name="maxPages"/>×100 comments — for a
+    /// triage agent that comments at most once per turn this is plenty.
+    /// </summary>
+    public async Task<IReadOnlyList<IssueCommentSummary>> ListIssueCommentsAsync(
+        string owner, string repo, int issueNumber,
+        int maxPages = 5, CancellationToken cancellationToken = default)
+    {
+        var results = new List<IssueCommentSummary>();
+        for (var page = 1; page <= maxPages; page++)
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get,
+                $"repos/{owner}/{repo}/issues/{issueNumber}/comments?per_page=100&page={page}");
+            var token = _tokens.GetToken();
+            if (string.IsNullOrEmpty(token))
+            {
+                Console.WriteLine($"[REST-ERR] list_comments {owner}/{repo}#{issueNumber}: no token");
+                return results;
+            }
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", StripBearer(token));
+
+            using var resp = await _http.SendAsync(req, cancellationToken);
+            var body = await resp.Content.ReadAsStringAsync(cancellationToken);
+            if (!resp.IsSuccessStatusCode)
+            {
+                Console.WriteLine(
+                    $"[REST-ERR] list_comments {owner}/{repo}#{issueNumber} page={page}: HTTP {(int)resp.StatusCode} {Trunc(body, 400)}");
+                return results;
+            }
+
+            using var doc = JsonDocument.Parse(body);
+            var arr = doc.RootElement;
+            if (arr.ValueKind != JsonValueKind.Array) break;
+            var pageCount = 0;
+            foreach (var c in arr.EnumerateArray())
+            {
+                pageCount++;
+                var id = c.TryGetProperty("id", out var idEl) && idEl.TryGetInt64(out var idVal) ? idVal : 0L;
+                var author = c.TryGetProperty("user", out var userEl)
+                    && userEl.TryGetProperty("login", out var loginEl)
+                        ? loginEl.GetString() ?? "" : "";
+                var cbody = c.TryGetProperty("body", out var bodyEl) ? bodyEl.GetString() ?? "" : "";
+                results.Add(new IssueCommentSummary(id, author, cbody));
+            }
+            if (pageCount < 100) break; // last page
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Scans BOT-AUTHORED comments newest-first and yields each base64-decoded
+    /// foundry-session payload. The handler iterates these and tries each in
+    /// turn — a single damaged or stale marker won't wedge the conversation,
+    /// it just falls through to the next-older one.
+    ///
+    /// Author filter: we only trust comments authored by a GitHub App (login
+    /// ends with <c>[bot]</c>). The <c>[bot]</c> suffix is reserved by GitHub
+    /// for app installations; users cannot register accounts ending in
+    /// <c>[bot]</c>. Without this filter a user could inject a hand-crafted
+    /// <c>&lt;!-- foundry-session:...--&gt;</c> in their own comment and hijack
+    /// the conversation pointer.
+    /// </summary>
+    public IEnumerable<string> EnumerateSessionJsonCandidates(IReadOnlyList<IssueCommentSummary> comments)
+    {
+        for (var i = comments.Count - 1; i >= 0; i--)
+        {
+            var c = comments[i];
+            if (!c.Author.EndsWith("[bot]", StringComparison.Ordinal)) continue;
+            var b = c.Body;
+            var start = b.IndexOf(FoundrySessionMarkerPrefix, StringComparison.Ordinal);
+            if (start < 0) continue;
+            var payloadStart = start + FoundrySessionMarkerPrefix.Length;
+            var end = b.IndexOf(FoundrySessionMarkerSuffix, payloadStart, StringComparison.Ordinal);
+            if (end < 0) continue;
+            var b64 = b[payloadStart..end].Trim();
+            string decoded;
+            try { decoded = Encoding.UTF8.GetString(Convert.FromBase64String(b64)); }
+            catch (FormatException) { continue; }
+            yield return decoded;
+        }
+    }
+
+    /// <summary>True if any BOT-AUTHORED comment carries the triage-reply marker.</summary>
+    public bool HasTriageReplyMarker(IReadOnlyList<IssueCommentSummary> comments)
+    {
+        foreach (var c in comments)
+        {
+            if (!c.Author.EndsWith("[bot]", StringComparison.Ordinal)) continue;
+            if (c.Body.Contains(TriageReplyMarker, StringComparison.Ordinal)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Builds the foundry-session marker line for a serialized AgentSession.
+    /// Base64-wrapping the JSON keeps the marker resilient to schema changes
+    /// (we don't have to know the inner field names) and prevents the payload
+    /// from colliding with HTML-comment terminators.
+    /// </summary>
+    public static string EncodeSessionMarker(string sessionJson)
+    {
+        var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(sessionJson));
+        return $"{FoundrySessionMarkerPrefix}{b64}{FoundrySessionMarkerSuffix}";
+    }
+
+    /// <summary>
+    /// PATCHes an existing comment, appending <paramref name="suffix"/> to its
+    /// body. The comments PATCH API replaces the body wholesale (no append
+    /// primitive), so we GET first, then PATCH — one extra round-trip per
+    /// turn, worth it for "no container-local state".
+    /// </summary>
+    public async Task<bool> AppendToCommentAsync(
+        string owner, string repo, long commentId, string suffix,
+        CancellationToken cancellationToken = default)
+    {
+        // Two attempts with a short delay — the marker PATCH is the single
+        // point of failure for Wave 2 conversation continuity; a transient
+        // 5xx or rate-limit blip here would silently break follow-up memory.
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            var ok = await TryAppendOnceAsync(owner, repo, commentId, suffix, attempt, cancellationToken);
+            if (ok) return true;
+            if (attempt < 2)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(750), cancellationToken);
+            }
+        }
+        return false;
+    }
+
+    private async Task<bool> TryAppendOnceAsync(
+        string owner, string repo, long commentId, string suffix, int attempt,
+        CancellationToken cancellationToken)
+    {
+        using var activity = s_activitySource.StartActivity("append_to_comment", ActivityKind.Client);
+        activity?.SetTag("github.owner", owner);
+        activity?.SetTag("github.repo", repo);
+        activity?.SetTag("github.comment_id", commentId);
+        activity?.SetTag("github.suffix.length", suffix.Length);
+        activity?.SetTag("retry.attempt", attempt);
+
+        var token = _tokens.GetToken();
+        if (string.IsNullOrEmpty(token))
+        {
+            Console.WriteLine($"[REST-ERR] append_comment {owner}/{repo}#{commentId}: no token");
+            activity?.SetStatus(ActivityStatusCode.Error);
+            return false;
+        }
+
+        using var getReq = new HttpRequestMessage(HttpMethod.Get,
+            $"repos/{owner}/{repo}/issues/comments/{commentId}");
+        getReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", StripBearer(token));
+        using var getResp = await _http.SendAsync(getReq, cancellationToken);
+        var getBody = await getResp.Content.ReadAsStringAsync(cancellationToken);
+        if (!getResp.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"[REST-ERR] append_comment GET {owner}/{repo}#{commentId}: HTTP {(int)getResp.StatusCode} {Trunc(getBody, 400)}");
+            activity?.SetStatus(ActivityStatusCode.Error);
+            return false;
+        }
+        string currentBody;
+        using (var doc = JsonDocument.Parse(getBody))
+        {
+            currentBody = doc.RootElement.TryGetProperty("body", out var bodyEl)
+                ? bodyEl.GetString() ?? "" : "";
+        }
+
+        var newBody = currentBody + "\n" + suffix;
+        var payload = JsonSerializer.Serialize(new { body = newBody });
+        using var patchReq = new HttpRequestMessage(HttpMethod.Patch,
+            $"repos/{owner}/{repo}/issues/comments/{commentId}")
+        {
+            Content = new StringContent(payload, Encoding.UTF8, "application/json"),
+        };
+        patchReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", StripBearer(token));
+        using var patchResp = await _http.SendAsync(patchReq, cancellationToken);
+        if (!patchResp.IsSuccessStatusCode)
+        {
+            var patchBody = await patchResp.Content.ReadAsStringAsync(cancellationToken);
+            Console.WriteLine($"[REST-ERR] append_comment PATCH {owner}/{repo}#{commentId}: HTTP {(int)patchResp.StatusCode} {Trunc(patchBody, 400)}");
+            activity?.SetStatus(ActivityStatusCode.Error);
+            return false;
+        }
+        Console.WriteLine($"[REST-OK] append_comment {owner}/{repo}#{commentId}: +{suffix.Length} chars");
+        activity?.SetTag("http.success", true);
+        return true;
+    }
+
+    /// <summary>Minimal comment record used for marker scanning.</summary>
+    public sealed record IssueCommentSummary(long Id, string Author, string Body);
 
     private async Task EnsureLabelExistsAsync(
         string owner, string repo, string name, CancellationToken cancellationToken)
@@ -257,7 +563,26 @@ public sealed class GitHubRestTools
                 $"FAILED: {label} returned HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {Trunc(body, 800)}");
         }
         Console.WriteLine($"[REST-OK] {label}: HTTP {(int)resp.StatusCode}");
-        return new RestResult(true, Trunc(body, 1500));
+        // Capture the Location header — for POST /comments, GitHub puts the
+        // canonical comment URL there ending in /comments/{id}. This is
+        // rock-solid for parsing the new comment ID and immune to body
+        // weirdness (compression, BOMs, large payloads, etc.).
+        string? location = null;
+        long? locationCommentId = null;
+        if (resp.Headers.Location is not null)
+        {
+            location = resp.Headers.Location.ToString();
+            var lastSlash = location.LastIndexOf('/');
+            if (lastSlash >= 0 && lastSlash < location.Length - 1
+                && long.TryParse(location[(lastSlash + 1)..], out var parsed))
+            {
+                locationCommentId = parsed;
+            }
+        }
+        // Return FULL body on success — Wave 2's TryReadCommentId parses it for
+        // the comment ID, and GitHub's comment response routinely exceeds 1500
+        // chars once our trace footer + triage template are included.
+        return new RestResult(true, body, location, locationCommentId);
     }
 
     private static string StripBearer(string token) =>
@@ -268,12 +593,13 @@ public sealed class GitHubRestTools
     private static string Trunc(string s, int max) =>
         s.Length > max ? s[..max] + "...[truncated]" : s;
 
-    private sealed record RestResult(bool Success, string Body);
+    private sealed record RestResult(bool Success, string Body, string? Location = null, long? LocationCommentId = null);
 
     public sealed class Counters
     {
         public int CommentsPosted;
         public int LabelsSet;
+        public long? LastCommentId;
     }
 
     private sealed class Restore(Action onDispose) : IDisposable

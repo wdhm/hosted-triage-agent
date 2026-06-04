@@ -21,7 +21,6 @@ namespace TriageAgent;
 /// </summary>
 public sealed class TriageInvocationHandler(
     AgentBundle agents,
-    FoundrySessionStore sessionStore,
     GitHubTokenProvider tokenProvider,
     GitHubRestTools restTools,
     ILogger<TriageInvocationHandler> logger) : InvocationHandler
@@ -219,28 +218,56 @@ public sealed class TriageInvocationHandler(
             return;
         }
 
-        // ── Pick agent + idempotency check ─────────────────────────────────
+        // ── Pick agent + idempotency check (Wave 2: GitHub-as-store) ───────
+        //
+        // We've replaced FoundrySessionStore (per-container file on the HOME
+        // volume) with a scan of bot comments on the issue itself. Two markers:
+        //   - <!-- triage-agent-reply -->   → emitted by the LLM on every reply.
+        //                                     Used for issue.opened idempotency
+        //                                     and for the workflow loop-guard.
+        //   - <!-- foundry-session:b64 -->  → appended by our code after a
+        //                                     successful RunAsync. Contains the
+        //                                     serialized AgentSession (a tiny
+        //                                     pointer to the server-side Foundry
+        //                                     conversation; the actual messages
+        //                                     live on the Responses API server).
+        //
+        // We list comments once here, then both checks read from the same list.
+        // For brand-new issues the list is empty and we go straight to a fresh
+        // conversation. Net cost vs. M4: +1 GET on first turn, +1 PATCH after
+        // every successful turn. Net benefit: zero container-local state.
+        IReadOnlyList<GitHubRestTools.IssueCommentSummary> existingComments;
+        try
+        {
+            existingComments = await restTools.ListIssueCommentsAsync(
+                payload.Owner!, payload.Repo!, payload.IssueNumber, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            // Don't fail the whole invocation just because comment listing
+            // threw — degrade to "fresh conversation, no idempotency check".
+            logger.LogWarning(ex, "ListIssueCommentsAsync threw; falling back to fresh-session path.");
+            existingComments = Array.Empty<GitHubRestTools.IssueCommentSummary>();
+        }
+
         AIAgent agent;
         if (eventType == "issue.opened")
         {
             agent = agents.Triage;
 
-            // Idempotent: if a session already exists for this issue, the
-            // agent has already triaged it. Don't redo work or wipe memory.
-            // (Workflow retries / manual re-runs on the same opened event
-            // would otherwise produce duplicate triage comments.)
-            //
-            // Safe to early-return because PR #35 only persists the session
-            // on SUCCESS — a failed first attempt leaves no marker behind.
-            if (sessionStore.Exists(sessionId))
+            // Idempotent: if any bot comment carries the triage-reply marker,
+            // this issue has already been triaged. Workflow retries / manual
+            // re-runs on the same opened event would otherwise produce
+            // duplicate triage comments.
+            if (restTools.HasTriageReplyMarker(existingComments))
             {
                 logger.LogInformation(
-                    "OK: already triaged #{Issue} (session {SessionId} exists)",
-                    payload.IssueNumber, sessionId);
+                    "OK: already triaged #{Issue} (triage-reply marker present in existing comments)",
+                    payload.IssueNumber);
                 response.StatusCode = StatusCodes.Status200OK;
                 response.ContentType = "text/plain; charset=utf-8";
                 await response.WriteAsync(
-                    $"OK: already triaged #{payload.IssueNumber} (session exists)",
+                    $"OK: already triaged #{payload.IssueNumber} (marker present)",
                     cancellationToken);
                 return;
             }
@@ -266,27 +293,55 @@ public sealed class TriageInvocationHandler(
             payload.CommentAuthor ?? "-");
 
         // ── Load/create session + invoke agent ─────────────────────────────
-        AgentSession session;
-        bool isNew;
-        try
+        // Wave 2: instead of reading a file from $HOME/sessions, we walk the
+        // bot comments we already fetched above for the newest valid
+        // foundry-session marker. If one decodes AND deserializes, resume it;
+        // otherwise fall through to the next-older marker; finally to a fresh
+        // session if none work. A single damaged or stale marker can't wedge
+        // the conversation. The full conversation history is server-side on
+        // Foundry — the marker only carries the ~24-byte pointer.
+        AgentSession? session = null;
+        bool isNew = true;
+        Exception? lastDeserializeError = null;
+        foreach (var candidate in restTools.EnumerateSessionJsonCandidates(existingComments))
         {
-            (session, isNew) = await sessionStore.GetOrCreateAsync(sessionId, cancellationToken);
+            try
+            {
+                var element = JsonSerializer.Deserialize<JsonElement>(candidate, JsonSerializerOptions.Web);
+                session = await agent.DeserializeSessionAsync(element, JsonSerializerOptions.Web, cancellationToken);
+                logger.LogInformation("Resumed Foundry session for {SessionId} from issue marker.", sessionId);
+                isNew = false;
+                break;
+            }
+            catch (Exception ex)
+            {
+                // Bad marker (corrupt JSON, stale conv ID from a previous
+                // deploy, etc.). Try the next-older one.
+                lastDeserializeError = ex;
+                logger.LogWarning(ex, "Skipping unusable foundry-session marker; trying older.");
+            }
         }
-        catch (Exception ex)
+        if (session is null)
         {
-            // Foundry may reject CreateSessionAsync during cold-start (model not
-            // warm, thread quota, transient backend). Don't let this leak as a
-            // raw ASP.NET 500 — surface it explicitly so the workflow retry can
-            // make a sensible decision and we see the cause in container logs.
-            Console.Error.WriteLine($"[handler] sessionStore.GetOrCreateAsync FAILED for {sessionId}: {ex.GetType().FullName}: {ex.Message}");
-            Console.Error.WriteLine(ex.ToString());
-            logger.LogError(ex, "Session create/restore failed for {SessionId}.", sessionId);
-            response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-            response.ContentType = "text/plain; charset=utf-8";
-            await response.WriteAsync(
-                $"FAILED: session unavailable ({ex.GetType().Name}: {ex.Message}). Retry recommended.",
-                cancellationToken);
-            return;
+            try
+            {
+                logger.LogInformation(
+                    "Creating new Foundry session for {SessionId} (no usable marker; lastError={LastError}).",
+                    sessionId, lastDeserializeError?.Message ?? "(none)");
+                session = await agent.CreateSessionAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[handler] session create FAILED for {sessionId}: {ex.GetType().FullName}: {ex.Message}");
+                Console.Error.WriteLine(ex.ToString());
+                logger.LogError(ex, "Session create failed for {SessionId}.", sessionId);
+                response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                response.ContentType = "text/plain; charset=utf-8";
+                await response.WriteAsync(
+                    $"FAILED: session unavailable ({ex.GetType().Name}: {ex.Message}). Retry recommended.",
+                    cancellationToken);
+                return;
+            }
         }
         logger.LogInformation("Session: id={SessionId} isNew={IsNew}", sessionId, isNew);
 
@@ -318,23 +373,11 @@ public sealed class TriageInvocationHandler(
             Console.Error.WriteLine(ex.ToString());
             logger.LogError(ex, "Agent run failed for {Event} on #{Issue}.", eventType, payload.IssueNumber);
 
-            // If we have a stored session and the run failed, the stored session
-            // pointer may be stale (e.g. Foundry thread expired or was created
-            // by a previous deployment of the agent). On next request we'd hit
-            // the same failure. Quarantine the bad session file so the next
-            // attempt starts fresh — accepting memory loss over permanent break.
-            if (!isNew)
-            {
-                try
-                {
-                    sessionStore.Quarantine(sessionId);
-                    Console.Error.WriteLine($"[handler] Quarantined stale session {sessionId}; next call will start fresh.");
-                }
-                catch (Exception qex)
-                {
-                    Console.Error.WriteLine($"[handler] Failed to quarantine {sessionId}: {qex.Message}");
-                }
-            }
+            // No marker to clean up — we only PATCH the foundry-session marker
+            // on SUCCESS, so a failed run leaves the previous marker (if any)
+            // untouched and the next attempt either retries from that pointer
+            // or starts fresh if none exists. Equivalent of the old quarantine
+            // semantics, but with zero local state.
 
             response.StatusCode = StatusCodes.Status502BadGateway;
             response.ContentType = "text/plain; charset=utf-8";
@@ -367,34 +410,41 @@ public sealed class TriageInvocationHandler(
             }
         }
 
-        // Persist session ONLY on success so a failed run leaves no marker
-        // behind. Otherwise the idempotency check above would short-circuit
-        // the next attempt with a fake "already triaged" — the very poison
-        // PR #35 fixed.
+        // Persist the Foundry session pointer ONLY on success, and ONLY by
+        // PATCHing the comment we just posted with a hidden marker. A failed
+        // run leaves no marker → next attempt re-uses whatever (older) marker
+        // is on the issue, or starts fresh. This is the Wave 2 contract: zero
+        // local state, the GitHub issue is the durable store.
         if (!failed)
         {
-            try
+            var commentId = restTools.LastPostedCommentId;
+            if (commentId is null)
             {
-                await sessionStore.SaveAsync(sessionId, session, cancellationToken);
+                logger.LogWarning(
+                    "Run succeeded but no comment ID captured — next turn will start a fresh conversation (memory loss on #{Issue}).",
+                    payload.IssueNumber);
             }
-            catch (Exception ex)
+            else
             {
-                // Don't fail the request — the comment is already posted. Warn.
-                logger.LogWarning(ex, "Failed to persist session {SessionId} after successful run.", sessionId);
-            }
-        }
-        else if (!isNew)
-        {
-            // Resumed session whose followup reply failed: quarantine so the
-            // next retry starts fresh rather than re-loading a broken thread.
-            try
-            {
-                sessionStore.Quarantine(sessionId);
-                Console.Error.WriteLine($"[handler] Quarantined session {sessionId} after FAILED reply.");
-            }
-            catch (Exception qex)
-            {
-                Console.Error.WriteLine($"[handler] Failed to quarantine {sessionId}: {qex.Message}");
+                try
+                {
+                    var serialized = await agent.SerializeSessionAsync(session, JsonSerializerOptions.Web, cancellationToken);
+                    var sessionJson = serialized.GetRawText();
+                    var marker = GitHubRestTools.EncodeSessionMarker(sessionJson);
+                    var patched = await restTools.AppendToCommentAsync(
+                        payload.Owner!, payload.Repo!, commentId.Value, marker, cancellationToken);
+                    if (!patched)
+                    {
+                        logger.LogWarning(
+                            "PATCH to embed foundry-session marker failed on comment {CommentId} (#{Issue}). Next turn will start fresh.",
+                            commentId.Value, payload.IssueNumber);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Don't fail the request — the comment is already posted. Warn.
+                    logger.LogWarning(ex, "Failed to embed foundry-session marker on comment {CommentId} (#{Issue}).", commentId.Value, payload.IssueNumber);
+                }
             }
         }
 
